@@ -334,6 +334,7 @@ var (
 	activeCfg      = defaultConfig()
 	configuredOnce bool
 	loopCancel     context.CancelFunc
+	configureMu    sync.Mutex // serializes configure() so concurrent (re)configures can't leak schedule loops
 
 	runMu       sync.Mutex
 	stateMu     sync.Mutex
@@ -421,6 +422,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func configure(raw []byte) error {
+	configureMu.Lock()
+	defer configureMu.Unlock()
 	cfg := defaultConfig()
 	var req lifecycleRequest
 	if len(raw) > 0 {
@@ -456,9 +459,7 @@ func configure(raw []byte) error {
 	activeCfg = cfg
 	configuredOnce = true
 	cfgMu.Unlock()
-	if cfg.Enabled {
-		startLoop(cfg)
-	}
+	startLoop(cfg)
 	hostLog("info", "codex-window-keeper configured", map[string]any{
 		"timezone": cfg.Timezone,
 		"times":    clockTimesToStrings(cfg.Times),
@@ -706,8 +707,14 @@ func startLoop(cfg pluginConfig) {
 	cfgMu.Lock()
 	loopCancel = cancel
 	cfgMu.Unlock()
-	go scheduleLoop(ctx, cfg)
+	// The reconcile janitor runs whenever the plugin is loaded — even while
+	// disabled — so a leftover priority bump (e.g. from a crash mid-warm) is
+	// restored rather than stranding an account at an elevated priority.
 	go reconcileLoop(ctx, cfg)
+	if !cfg.Enabled {
+		return
+	}
+	go scheduleLoop(ctx, cfg)
 	if cfg.StartupRun {
 		go runSlot(context.Background(), cfg, "startup", true)
 	}
