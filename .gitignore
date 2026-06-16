@@ -1,0 +1,10 @@
+# Runtime state: live auth IDs + per-slot attempt records, rewritten on every run.
+/state/*
+!/state/.gitkeep
+
+# Build artifacts (c-shared output goes to ../plugins/<os>/<arch>/).
+*.so
+*.h
+
+# OS / editor noise.
+.DS_Store
