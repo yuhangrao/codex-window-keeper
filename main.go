@@ -924,7 +924,17 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 				}
 			}
 
-			if index < len(auths)-1 && cfg.BetweenAuthDelay > 0 {
+			// Space out sends, but only when another pending auth still needs
+			// sending later in this pass — so a retry pass that ends on an
+			// already-sent slice element doesn't tack on a spurious trailing delay.
+			laterPending := false
+			for _, later := range auths[index+1:] {
+				if _, ok := pending[later.ID]; ok {
+					laterPending = true
+					break
+				}
+			}
+			if laterPending && cfg.BetweenAuthDelay > 0 {
 				select {
 				case <-ctx.Done():
 					summary.Results = recordsFromMap(latest)
@@ -1147,7 +1157,11 @@ func warmAuth(ctx context.Context, cfg pluginConfig, slot string, auth authEntry
 	if topPriority > bumpTarget {
 		bumpTarget = topPriority
 	}
-	if err := recordBump(auth.ID, auth.Priority); err != nil {
+	// recordBump is first-write-wins, so original is the authoritative value to
+	// restore to — not auth.Priority, which (after a prior failed restore) may
+	// be the stale already-raised value reported by the run-start auth list.
+	original, err := recordBump(auth.ID, auth.Priority)
+	if err != nil {
 		return fmt.Errorf("persist bump state: %w", err)
 	}
 	if err := setAuthPriority(ctx, cfg, auth.ID, bumpTarget); err != nil {
@@ -1156,10 +1170,10 @@ func warmAuth(ctx context.Context, cfg pluginConfig, slot string, auth authEntry
 		// reconcileBumps if this also fails. Quiet on failure — the raise error
 		// returned below is what gets surfaced, and a never-applied raise needs
 		// no alarm.
-		_ = tryRestoreAuthPriority(cfg, auth.ID, auth.Priority)
+		_ = tryRestoreAuthPriority(cfg, auth.ID, original)
 		return fmt.Errorf("raise priority: %w", err)
 	}
-	defer restoreAuthPriority(cfg, auth.ID, auth.Priority)
+	defer restoreAuthPriority(cfg, auth.ID, original)
 	return sendHi(ctx, cfg, slot, auth)
 }
 
@@ -1643,20 +1657,24 @@ func updateAttempt(key string, record attemptRecord) error {
 // recordBump durably remembers an auth's original priority before the plugin
 // raises it, so a crash before restore can be reconciled later. First write
 // wins: if an entry already exists (a prior restore failed and left it), that
-// entry holds the true original, so it must not be overwritten with the
-// already-raised priority — otherwise a later restore would land on the wrong
-// value.
-func recordBump(authID string, originalPriority int) error {
+// entry holds the true original and is kept — the already-raised priority that
+// the current run-start auth list may report is NOT written over it. Returns
+// the priority to restore to (the recorded original), so the caller restores
+// to that authoritative value rather than the possibly-stale list value.
+func recordBump(authID string, originalPriority int) (int, error) {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	if keeperState.Bumps == nil {
 		keeperState.Bumps = map[string]int{}
 	}
-	if _, exists := keeperState.Bumps[authID]; exists {
-		return nil
+	if existing, exists := keeperState.Bumps[authID]; exists {
+		return existing, nil
 	}
 	keeperState.Bumps[authID] = originalPriority
-	return saveStateLocked()
+	if err := saveStateLocked(); err != nil {
+		return originalPriority, err
+	}
+	return originalPriority, nil
 }
 
 func clearBump(authID string) error {

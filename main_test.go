@@ -276,7 +276,7 @@ func TestBumpStateRoundTrip(t *testing.T) {
 	if len(pendingBumps()) != 0 {
 		t.Fatal("expected no pending bumps initially")
 	}
-	if err := recordBump("codex-a.json", 8); err != nil {
+	if _, err := recordBump("codex-a.json", 8); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingBumps()["codex-a.json"]; got != 8 {
@@ -427,7 +427,7 @@ func TestReconcileBumpsRestoresAndClears(t *testing.T) {
 	rr := &mgmtRecorder{}
 	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
 	defer srv.Close()
-	if err := recordBump("codex-a.json", 8); err != nil {
+	if _, err := recordBump("codex-a.json", 8); err != nil {
 		t.Fatal(err)
 	}
 	cfg := defaultConfig()
@@ -579,17 +579,59 @@ func TestRecordBumpFirstWriteWins(t *testing.T) {
 	if err := loadState(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := recordBump("codex-x.json", 8); err != nil {
+	if got, err := recordBump("codex-x.json", 8); err != nil {
 		t.Fatal(err)
+	} else if got != 8 {
+		t.Fatalf("first recordBump should return the recorded original; got %d, want 8", got)
 	}
 	// A second record (e.g. a re-bump after a prior restore failed and left the
 	// entry) must NOT overwrite the true original (8) with the already-raised
-	// value (10), or a later restore would land on the wrong priority.
-	if err := recordBump("codex-x.json", 10); err != nil {
+	// value (10), and must RETURN 8 so the caller restores to the true original.
+	got, err := recordBump("codex-x.json", 10)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := pendingBumps()["codex-x.json"]; got != 8 {
-		t.Fatalf("recordBump must keep the first (true original) priority; got %d, want 8", got)
+	if got != 8 {
+		t.Fatalf("recordBump must return the first (true original) priority; got %d, want 8", got)
+	}
+	if p := pendingBumps()["codex-x.json"]; p != 8 {
+		t.Fatalf("stored bump must stay at the true original; got %d, want 8", p)
+	}
+}
+
+func TestWarmAuthRestoresToRecordedOriginalWhenListIsStale(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a prior failed restore: the true original (8) is already recorded,
+	// while the run-start auth list now reports the auth at its stale, already-
+	// raised value (9). The restore must target the recorded original, not 9.
+	if _, err := recordBump("codex-low.json", 8); err != nil {
+		t.Fatal(err)
+	}
+	rr := &mgmtRecorder{} // 200 OK for raise and restore
+	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
+	defer srv.Close()
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = srv.URL
+	cfg.ManagementKey = "k"
+	cfg.ManagementCACert = writeServerCA(t, srv)
+	cfg.BumpPriority = 10
+	auth := authEntry{ID: "codex-low.json", Name: "codex-low.json", Priority: 9} // stale list value
+	// Below the top tier (10), so it is re-bumped; the warm fails (no host), but
+	// the deferred restore still runs and must use the recorded original (8).
+	_ = warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 10)
+	rr.mu.Lock()
+	body := rr.body
+	rr.mu.Unlock()
+	var decoded struct {
+		Priority int `json:"priority"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("restore body not json: %v (%s)", err, body)
+	}
+	if decoded.Priority != 8 {
+		t.Fatalf("restore must use recorded original 8, not stale list value 9; got %d", decoded.Priority)
 	}
 }
 
