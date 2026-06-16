@@ -337,6 +337,12 @@ var (
 	configureMu    sync.Mutex // serializes configure()/shutdown so they can't leak schedule loops; read/written only under it
 	shuttingDown   bool       // set once shutdown begins; guarded by configureMu so a racing configure won't (re)start loops after teardown
 
+	// runsCtx parents manual and startup runs (which are not tied to the
+	// schedule loop). It is cancelled once, at shutdown, so an in-flight
+	// manual/startup run stops invoking host callbacks during teardown.
+	// Scheduled runs use the loop context instead and are cancelled by stopLoop.
+	runsCtx, runsCancel = context.WithCancel(context.Background())
+
 	runMu       sync.Mutex
 	stateMu     sync.Mutex
 	statePath   string
@@ -402,11 +408,13 @@ func cliproxyPluginShutdown() {
 	// that nothing then cancels. The shuttingDown flag makes a configure() that
 	// arrives after teardown a no-op (the host should not reconfigure-after-
 	// shutdown, but we do not rely on host ordering — same rationale as
-	// configureMu itself).
+	// configureMu itself). runsCancel stops any in-flight manual/startup run,
+	// which uses runsCtx rather than the loop context that stopLoop cancels.
 	configureMu.Lock()
 	defer configureMu.Unlock()
 	shuttingDown = true
 	stopLoop()
+	runsCancel()
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -730,7 +738,7 @@ func startLoop(cfg pluginConfig) {
 	}
 	go scheduleLoop(ctx, cfg)
 	if cfg.StartupRun {
-		go runSlot(context.Background(), cfg, "startup", true)
+		go runSlot(runsCtx, cfg, "startup", true)
 	}
 }
 
@@ -927,14 +935,7 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 			// Space out sends, but only when another pending auth still needs
 			// sending later in this pass — so a retry pass that ends on an
 			// already-sent slice element doesn't tack on a spurious trailing delay.
-			laterPending := false
-			for _, later := range auths[index+1:] {
-				if _, ok := pending[later.ID]; ok {
-					laterPending = true
-					break
-				}
-			}
-			if laterPending && cfg.BetweenAuthDelay > 0 {
+			if cfg.BetweenAuthDelay > 0 && hasLaterPending(auths, index, pending) {
 				select {
 				case <-ctx.Done():
 					summary.Results = recordsFromMap(latest)
@@ -968,6 +969,19 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 	if manual {
 		hostLog("info", "codex-window-keeper manual run completed", map[string]any{"slot": slot, "count": len(summary.Results)})
 	}
+}
+
+// hasLaterPending reports whether any auth after index in the slice is still
+// pending this pass. It gates the inter-auth delay so the delay spaces real
+// sends without tacking a trailing wait onto a pass that ends on an
+// already-sent (skipped) slice element.
+func hasLaterPending(auths []authEntry, index int, pending map[string]authEntry) bool {
+	for _, later := range auths[index+1:] {
+		if _, ok := pending[later.ID]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func listCodexAuths(ctx context.Context, cfg pluginConfig) ([]authEntry, error) {
@@ -1355,7 +1369,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 		cfg := currentConfig()
 		slot := "manual-" + time.Now().In(mustLocation(cfg.Timezone)).Format("2006-01-02 15:04:05")
 		setRunning(slot)
-		go runSlot(context.Background(), cfg, slot, true)
+		go runSlot(runsCtx, cfg, slot, true)
 		// Redirect to the query-less page so the browser (and its auto-refresh)
 		// shows live progress without re-triggering the run on every reload.
 		return okEnvelope(managementResponse{
@@ -1672,6 +1686,10 @@ func recordBump(authID string, originalPriority int) (int, error) {
 	}
 	keeperState.Bumps[authID] = originalPriority
 	if err := saveStateLocked(); err != nil {
+		// The caller aborts (does not raise) when this errors, so don't leave an
+		// in-memory record for an auth that was never bumped — it would otherwise
+		// trigger a redundant reconcile PATCH later. Roll back to match disk.
+		delete(keeperState.Bumps, authID)
 		return originalPriority, err
 	}
 	return originalPriority, nil

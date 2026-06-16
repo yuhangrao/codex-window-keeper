@@ -686,6 +686,57 @@ func TestConfigureNoOpAfterShutdown(t *testing.T) {
 	}
 }
 
+func TestRecordBumpRollsBackWhenPersistFails(t *testing.T) {
+	// Force saveStateLocked to fail by leaving statePath empty (no loadState).
+	stateMu.Lock()
+	statePath = ""
+	keeperState = stateFile{Attempts: map[string]attemptRecord{}}
+	stateMu.Unlock()
+	t.Cleanup(func() {
+		stateMu.Lock()
+		statePath = ""
+		keeperState = stateFile{Attempts: map[string]attemptRecord{}}
+		stateMu.Unlock()
+	})
+	if _, err := recordBump("codex-x.json", 8); err == nil {
+		t.Fatal("expected a persist error when statePath is empty")
+	}
+	// A failed persist must not leave an in-memory record for an auth that was
+	// never raised (the caller aborts before the raise).
+	if len(pendingBumps()) != 0 {
+		t.Fatalf("failed persist must roll back the in-memory bump; got %#v", pendingBumps())
+	}
+}
+
+func TestHasLaterPending(t *testing.T) {
+	auths := []authEntry{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}}
+	mk := func(ids ...string) map[string]authEntry {
+		m := map[string]authEntry{}
+		for _, id := range ids {
+			m[id] = authEntry{ID: id}
+		}
+		return m
+	}
+	cases := []struct {
+		name    string
+		index   int
+		pending map[string]authEntry
+		want    bool
+	}{
+		{"later pending exists", 0, mk("b", "d"), true},
+		{"mid with later pending", 1, mk("b", "c"), true},
+		{"last pending is current, none later", 1, mk("a", "b"), false},
+		{"single pending, last slice element", 3, mk("d"), false},
+		{"single pending, not last element", 0, mk("a"), false},
+		{"last index is always false", 3, mk("a", "b", "c", "d"), false},
+	}
+	for _, tc := range cases {
+		if got := hasLaterPending(auths, tc.index, tc.pending); got != tc.want {
+			t.Errorf("%s: hasLaterPending(index=%d)=%v, want %v", tc.name, tc.index, got, tc.want)
+		}
+	}
+}
+
 func mustParseNominalSlotForTest(t *testing.T, slot string, loc *time.Location) time.Time {
 	t.Helper()
 	nominalAt, ok := parseNominalSlot(slot, loc)
