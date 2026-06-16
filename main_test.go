@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -228,6 +232,105 @@ func TestKeepaliveBodyInputIsListWithoutMetadata(t *testing.T) {
 	}
 	if item.Content[0].Type != "input_text" || item.Content[0].Text != "hi" {
 		t.Fatalf("unexpected input content: %s", body)
+	}
+}
+
+func TestBuildSetPriorityRequest(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = "https://127.0.0.1:8317"
+	cfg.ManagementKey = "secret-key"
+	req, err := buildSetPriorityRequest(context.Background(), cfg, "codex-x.json", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != http.MethodPatch {
+		t.Fatalf("method = %s, want PATCH", req.Method)
+	}
+	if got := req.URL.String(); got != "https://127.0.0.1:8317/v0/management/auth-files/fields" {
+		t.Fatalf("url = %s", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer secret-key" {
+		t.Fatalf("authorization = %q", got)
+	}
+	body, _ := io.ReadAll(req.Body)
+	var decoded struct {
+		Name     string `json:"name"`
+		Priority int    `json:"priority"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("body not json: %v (%s)", err, body)
+	}
+	if decoded.Name != "codex-x.json" || decoded.Priority != 10 {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+func TestBumpStateRoundTrip(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingBumps()) != 0 {
+		t.Fatal("expected no pending bumps initially")
+	}
+	if err := recordBump("codex-a.json", 8); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingBumps()["codex-a.json"]; got != 8 {
+		t.Fatalf("recorded bump = %d, want 8", got)
+	}
+	if err := clearBump("codex-a.json"); err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingBumps()) != 0 {
+		t.Fatal("expected no pending bumps after clear")
+	}
+}
+
+func TestWarmAuthLowPriorityRequiresManagementKey(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.ManagementKey = ""
+	cfg.BumpPriority = 10
+	auth := authEntry{ID: "codex-low.json", Name: "codex-low.json", Priority: 8}
+	err := warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 9)
+	if err == nil || !strings.Contains(err.Error(), "management_key") {
+		t.Fatalf("expected management_key error, got %v", err)
+	}
+	if len(pendingBumps()) != 0 {
+		t.Fatal("must not record a bump when management_key is missing")
+	}
+}
+
+func TestWarmAuthTopTierDoesNotBump(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.BumpPriority = 10
+	auth := authEntry{ID: "codex-top.json", Name: "codex-top.json", Priority: 10}
+	// No host is wired in unit tests, so the underlying send fails — the point is
+	// that a top-tier auth is warmed directly and never recorded as a bump.
+	_ = warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 10)
+	if len(pendingBumps()) != 0 {
+		t.Fatalf("top-tier auth must not be bumped, got %#v", pendingBumps())
+	}
+}
+
+func TestListCodexAuthsFromDirReadsPriority(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/codex-p@example.com-team.json", []byte(`{"priority":8,"disabled":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.AuthDir = dir
+	auths, err := listCodexAuthsFromDir(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(auths) != 1 || auths[0].Priority != 8 {
+		t.Fatalf("expected priority 8 read from file, got %#v", auths)
 	}
 }
 

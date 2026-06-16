@@ -59,10 +59,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,10 +91,15 @@ const (
 	methodHostLog            = "host.log"
 
 	pluginID      = "codex-window-keeper"
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.4.0"
 
 	defaultTargetHeader = "X-Codex-Window-Keeper-Target-Auth"
 	defaultMarkerHeader = "X-Codex-Window-Keeper"
+
+	// managementAuthFieldsPath is the CLIProxyAPI management endpoint that patches
+	// individual auth-file fields (used here to temporarily raise an auth's
+	// priority so the host's selection will route a keepalive to it).
+	managementAuthFieldsPath = "/v0/management/auth-files/fields"
 )
 
 type envelope struct {
@@ -128,6 +136,13 @@ type pluginConfig struct {
 	StartupRun              bool
 	DryRun                  bool
 	IncludeUnavailableAuths bool
+
+	// Management API access, used to temporarily raise a lower-priority Codex
+	// auth into the host's top priority tier so a keepalive can be routed to it.
+	ManagementBaseURL string
+	ManagementKey     string
+	ManagementCACert  string
+	BumpPriority      int
 }
 
 type clockTime struct {
@@ -208,6 +223,7 @@ type authEntry struct {
 	Path        string `json:"path"`
 	Email       string `json:"email"`
 	Note        string `json:"note"`
+	Priority    int    `json:"priority"`
 }
 
 type hostModelExecutionRequest struct {
@@ -281,6 +297,10 @@ type managementResponse struct {
 
 type stateFile struct {
 	Attempts map[string]attemptRecord `json:"attempts"`
+	// Bumps maps an auth ID to the priority it had before the plugin temporarily
+	// raised it. A non-empty entry means a restore is owed (used to recover from
+	// a crash between raising and restoring a priority).
+	Bumps map[string]int `json:"bumps,omitempty"`
 }
 
 type attemptRecord struct {
@@ -444,6 +464,10 @@ func pluginRegistration() registration {
 				{Name: "prompt", Type: "string", Description: "Prompt sent to each Codex auth."},
 				{Name: "auth_dir", Type: "string", Description: "Fallback local auth directory used when the host auth-list callback is unavailable."},
 				{Name: "retry_delay_seconds", Type: "number", Description: "Delay before retrying auths that have not succeeded in the current slot."},
+				{Name: "management_key", Type: "string", Description: "CLIProxyAPI management key (raw). Required to warm Codex auths below the top priority tier; the plugin uses it to temporarily raise their priority and restore it after."},
+				{Name: "management_base_url", Type: "string", Description: "CLIProxyAPI management API base URL. Default https://127.0.0.1:8317."},
+				{Name: "management_ca_cert", Type: "string", Description: "PEM file used to verify the management API's TLS certificate. Default /CLIProxyAPI/certs/cert.pem."},
+				{Name: "bump_priority", Type: "number", Description: "Priority a lower-tier auth is temporarily raised to so the host will route a keepalive to it. Default 10."},
 				{Name: "dry_run", Type: "boolean", Description: "When true, record attempts without sending model requests."},
 			},
 		},
@@ -473,6 +497,10 @@ func defaultConfig() pluginConfig {
 		MarkerHeader:     defaultMarkerHeader,
 		StartupRun:       false,
 		DryRun:           false,
+
+		ManagementBaseURL: "https://127.0.0.1:8317",
+		ManagementCACert:  "/CLIProxyAPI/certs/cert.pem",
+		BumpPriority:      10,
 	}
 }
 
@@ -534,6 +562,18 @@ func (cfg *pluginConfig) normalize() {
 	cfg.MarkerHeader = strings.TrimSpace(cfg.MarkerHeader)
 	if cfg.MarkerHeader == "" {
 		cfg.MarkerHeader = defaultMarkerHeader
+	}
+	cfg.ManagementBaseURL = strings.TrimRight(strings.TrimSpace(cfg.ManagementBaseURL), "/")
+	if cfg.ManagementBaseURL == "" {
+		cfg.ManagementBaseURL = "https://127.0.0.1:8317"
+	}
+	cfg.ManagementKey = strings.TrimSpace(cfg.ManagementKey)
+	cfg.ManagementCACert = strings.TrimSpace(cfg.ManagementCACert)
+	if cfg.ManagementCACert == "" {
+		cfg.ManagementCACert = "/CLIProxyAPI/certs/cert.pem"
+	}
+	if cfg.BumpPriority <= 0 {
+		cfg.BumpPriority = 10
 	}
 }
 
@@ -613,6 +653,16 @@ func applyConfigYAML(cfg *pluginConfig, raw []byte) error {
 			cfg.TargetHeader = unquote(value)
 		case "marker_header":
 			cfg.MarkerHeader = unquote(value)
+		case "management_base_url":
+			cfg.ManagementBaseURL = unquote(value)
+		case "management_key":
+			cfg.ManagementKey = unquote(value)
+		case "management_ca_cert":
+			cfg.ManagementCACert = unquote(value)
+		case "bump_priority":
+			if v, ok := parseInt(value); ok {
+				cfg.BumpPriority = v
+			}
 		case "startup_run":
 			if v, ok := parseBool(value); ok {
 				cfg.StartupRun = v
@@ -636,6 +686,18 @@ func startLoop(cfg pluginConfig) {
 	loopCancel = cancel
 	cfgMu.Unlock()
 	go scheduleLoop(ctx, cfg)
+	// Recover any leftover priority bumps shortly after (re)start — once the
+	// host's management listener is up — instead of waiting for the next slot.
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Second):
+		}
+		rctx, rcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer rcancel()
+		reconcileBumps(rctx, cfg)
+	}()
 	if cfg.StartupRun {
 		go runSlot(context.Background(), cfg, "startup", true)
 	}
@@ -688,6 +750,11 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	summary := runSummary{Slot: slot, StartedAt: startedAt, DryRun: cfg.DryRun}
+	// Restore any priorities a previous run raised but failed to restore (crash
+	// recovery) before listing, so the auth list reflects true priorities.
+	reconcileCtx, reconcileCancel := context.WithTimeout(parent, 30*time.Second)
+	reconcileBumps(reconcileCtx, cfg)
+	reconcileCancel()
 	listCtx, listCancel := context.WithTimeout(parent, 30*time.Second)
 	auths, err := listCodexAuths(listCtx, cfg)
 	listCancel()
@@ -697,6 +764,15 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 		setLastSummary(summary)
 		hostLog("error", "codex-window-keeper failed to list auths", map[string]any{"slot": slot, "error": err.Error()})
 		return
+	}
+
+	// The host offers only the highest-priority tier as scheduler candidates;
+	// auths below this need a temporary priority bump to be warmable.
+	topPriority := 0
+	for _, auth := range auths {
+		if auth.Priority > topPriority {
+			topPriority = auth.Priority
+		}
 	}
 
 	loc := mustLocation(cfg.Timezone)
@@ -793,7 +869,7 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 				continue
 			}
 
-			errSend := sendHi(ctx, cfg, slot, auth)
+			errSend := warmAuth(ctx, cfg, slot, auth, topPriority)
 			if errSend != nil {
 				record.Status = "failed"
 				record.Error = errSend.Error()
@@ -916,14 +992,28 @@ func listCodexAuthsFromDir(cfg pluginConfig) ([]authEntry, error) {
 		if !strings.HasPrefix(lower, "codex-") || !strings.HasSuffix(lower, ".json") {
 			continue
 		}
-		auths = append(auths, authEntry{
+		path := filepath.Join(cfg.AuthDir, name)
+		ae := authEntry{
 			ID:       name,
 			Name:     name,
 			Type:     "codex",
 			Provider: "codex",
 			Source:   "file",
-			Path:     filepath.Join(cfg.AuthDir, name),
-		})
+			Path:     path,
+		}
+		// Pull priority/disabled straight from the file so the fallback path has
+		// the same fields the host auth-list callback would provide.
+		if raw, errRead := os.ReadFile(path); errRead == nil {
+			var meta struct {
+				Priority int  `json:"priority"`
+				Disabled bool `json:"disabled"`
+			}
+			if json.Unmarshal(raw, &meta) == nil {
+				ae.Priority = meta.Priority
+				ae.Disabled = meta.Disabled
+			}
+		}
+		auths = append(auths, ae)
 	}
 	return normalizeAuthEntries(auths, cfg), nil
 }
@@ -1002,6 +1092,149 @@ func keepaliveBody(cfg pluginConfig) ([]byte, error) {
 		return nil, fmt.Errorf("marshal keepalive request: %w", err)
 	}
 	return raw, nil
+}
+
+// warmAuth sends one keepalive to auth. Accounts already at (or above) the
+// configured bump priority are top-tier candidates and are warmed directly.
+// Lower-priority accounts are excluded from the host's candidate set (the host
+// only offers the top priority tier), so the plugin temporarily raises the
+// account's priority via the management API, warms it through the host's codex
+// executor, then restores the original priority. Routing the warm through
+// host.model.execute keeps the request byte-identical to the host's own codex
+// requests (no replication, no risk-control concern).
+func warmAuth(ctx context.Context, cfg pluginConfig, slot string, auth authEntry, topPriority int) error {
+	// Auths already in the top priority tier are offered to the scheduler as-is.
+	if auth.Priority >= topPriority {
+		return sendHi(ctx, cfg, slot, auth)
+	}
+	// Lower-priority auths are excluded from the candidate set, so temporarily
+	// raise this one to at least the top tier to make it selectable, then restore.
+	if cfg.ManagementKey == "" {
+		return fmt.Errorf("auth priority %d is below top tier %d and management_key is not configured; cannot raise it to warm", auth.Priority, topPriority)
+	}
+	bumpTarget := cfg.BumpPriority
+	if topPriority > bumpTarget {
+		bumpTarget = topPriority
+	}
+	if err := recordBump(auth.ID, auth.Priority); err != nil {
+		return fmt.Errorf("persist bump state: %w", err)
+	}
+	if err := setAuthPriority(ctx, cfg, auth.ID, bumpTarget); err != nil {
+		_ = clearBump(auth.ID)
+		return fmt.Errorf("raise priority: %w", err)
+	}
+	defer restoreAuthPriority(cfg, auth.ID, auth.Priority)
+	return sendHi(ctx, cfg, slot, auth)
+}
+
+// restoreAuthPriority returns auth to its original priority. It uses a fresh
+// context so a cancelled run context (slot deadline) cannot skip the restore.
+// On failure the bump record is left in place for reconcileBumps to retry.
+func restoreAuthPriority(cfg pluginConfig, authID string, original int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := setAuthPriority(ctx, cfg, authID, original); err != nil {
+		hostLog("error", "codex-window-keeper failed to restore priority after warm; will reconcile later", map[string]any{"auth_id": authID, "priority": original, "error": err.Error()})
+		return
+	}
+	_ = clearBump(authID)
+}
+
+// reconcileBumps restores any priorities the plugin raised but did not restore
+// (e.g. a crash between raise and restore). Safe to call repeatedly.
+func reconcileBumps(ctx context.Context, cfg pluginConfig) {
+	bumps := pendingBumps()
+	if len(bumps) == 0 {
+		return
+	}
+	if cfg.ManagementKey == "" {
+		hostLog("warn", "codex-window-keeper has pending priority restores but management_key is not configured", map[string]any{"count": len(bumps)})
+		return
+	}
+	for authID, original := range bumps {
+		if err := setAuthPriority(ctx, cfg, authID, original); err != nil {
+			hostLog("error", "codex-window-keeper failed to restore bumped priority", map[string]any{"auth_id": authID, "priority": original, "error": err.Error()})
+			continue
+		}
+		_ = clearBump(authID)
+		hostLog("info", "codex-window-keeper restored bumped priority", map[string]any{"auth_id": authID, "priority": original})
+	}
+}
+
+// setAuthPriority patches one auth's priority through the CLIProxyAPI management
+// API. The host applies it immediately and re-persists the auth from its own
+// current in-memory tokens, so this does not clobber a concurrent token refresh.
+func setAuthPriority(ctx context.Context, cfg pluginConfig, authID string, priority int) error {
+	if cfg.ManagementKey == "" {
+		return fmt.Errorf("management_key is not configured")
+	}
+	client, err := managementHTTPClient(cfg)
+	if err != nil {
+		return err
+	}
+	req, err := buildSetPriorityRequest(ctx, cfg, authID, priority)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("management request: %w", err)
+	}
+	defer resp.Body.Close()
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("management priority patch returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	return nil
+}
+
+// buildSetPriorityRequest builds the management PATCH request for one auth's
+// priority. Separated for testability.
+func buildSetPriorityRequest(ctx context.Context, cfg pluginConfig, authID string, priority int) (*http.Request, error) {
+	body, err := json.Marshal(map[string]any{"name": authID, "priority": priority})
+	if err != nil {
+		return nil, fmt.Errorf("marshal priority patch: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, cfg.ManagementBaseURL+managementAuthFieldsPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.ManagementKey)
+	return req, nil
+}
+
+var (
+	mgmtClientMu sync.Mutex
+	mgmtClient   *http.Client
+	mgmtClientCA string
+)
+
+// managementHTTPClient returns a client that verifies the management API's TLS
+// certificate against cfg.ManagementCACert (the host's self-signed cert, whose
+// SAN covers 127.0.0.1). The client is cached and rebuilt when the CA path
+// changes.
+func managementHTTPClient(cfg pluginConfig) (*http.Client, error) {
+	mgmtClientMu.Lock()
+	defer mgmtClientMu.Unlock()
+	if mgmtClient != nil && mgmtClientCA == cfg.ManagementCACert {
+		return mgmtClient, nil
+	}
+	pem, err := os.ReadFile(cfg.ManagementCACert)
+	if err != nil {
+		return nil, fmt.Errorf("read management CA cert %s: %w", cfg.ManagementCACert, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("management CA cert %s contains no certificates", cfg.ManagementCACert)
+	}
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+	}
+	mgmtClient = client
+	mgmtClientCA = cfg.ManagementCACert
+	return client, nil
 }
 
 func pickAuth(raw []byte) ([]byte, error) {
@@ -1100,6 +1333,11 @@ func renderStatusPage() []byte {
 	writeCard(&out, "Model", html.EscapeString(cfg.Model))
 	writeCard(&out, "Reasoning effort", html.EscapeString(cfg.ReasoningEffort))
 	writeCard(&out, "Attempts recorded", strconv.Itoa(attemptCount))
+	bumpBadge := `<span class="badge muted">off</span>`
+	if cfg.ManagementKey != "" {
+		bumpBadge = `<span class="badge ok">&rarr; ` + strconv.Itoa(cfg.BumpPriority) + `</span>`
+	}
+	writeCard(&out, "Priority bump", bumpBadge)
 	out.WriteString(`</section>`)
 
 	if authErr != "" {
@@ -1291,13 +1529,16 @@ func loadState(dir string) error {
 		return err
 	}
 	path := filepath.Join(dir, "state.json")
-	next := stateFile{Attempts: map[string]attemptRecord{}}
+	next := stateFile{Attempts: map[string]attemptRecord{}, Bumps: map[string]int{}}
 	if raw, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
 		if err := json.Unmarshal(raw, &next); err != nil {
 			return err
 		}
 		if next.Attempts == nil {
 			next.Attempts = map[string]attemptRecord{}
+		}
+		if next.Bumps == nil {
+			next.Bumps = map[string]int{}
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
@@ -1327,6 +1568,38 @@ func updateAttempt(key string, record attemptRecord) error {
 	}
 	keeperState.Attempts[key] = record
 	return saveStateLocked()
+}
+
+// recordBump durably remembers an auth's original priority before the plugin
+// raises it, so a crash before restore can be reconciled later.
+func recordBump(authID string, originalPriority int) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if keeperState.Bumps == nil {
+		keeperState.Bumps = map[string]int{}
+	}
+	keeperState.Bumps[authID] = originalPriority
+	return saveStateLocked()
+}
+
+func clearBump(authID string) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if keeperState.Bumps == nil {
+		return nil
+	}
+	delete(keeperState.Bumps, authID)
+	return saveStateLocked()
+}
+
+func pendingBumps() map[string]int {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	out := make(map[string]int, len(keeperState.Bumps))
+	for authID, priority := range keeperState.Bumps {
+		out[authID] = priority
+	}
+	return out
 }
 
 func saveStateLocked() error {
