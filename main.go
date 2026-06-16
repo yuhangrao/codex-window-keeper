@@ -88,7 +88,7 @@ const (
 	methodHostLog            = "host.log"
 
 	pluginID      = "codex-window-keeper"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.2.0"
 
 	defaultTargetHeader = "X-Codex-Window-Keeper-Target-Auth"
 	defaultMarkerHeader = "X-Codex-Window-Keeper"
@@ -1044,47 +1044,190 @@ func handleManagement(raw []byte) ([]byte, error) {
 func renderStatusPage() []byte {
 	cfg := currentConfig()
 	summary := getLastSummary()
+	loc := mustLocation(cfg.Timezone)
 	stateMu.Lock()
 	attemptCount := len(keeperState.Attempts)
 	stateMu.Unlock()
-	authCount := "unknown"
+
+	authCount := ""
+	authErr := ""
 	authCheckCtx, authCheckCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if auths, err := listCodexAuths(authCheckCtx, cfg); err == nil {
 		authCount = strconv.Itoa(len(auths))
 	} else {
-		authCount = "error: " + err.Error()
+		authErr = err.Error()
 	}
 	authCheckCancel()
-	var out bytes.Buffer
-	out.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Codex Window Keeper</title>")
-	out.WriteString("<style>body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:2rem;line-height:1.45;color:#1f2933}code,pre{background:#f3f4f6;border-radius:6px}code{padding:.1rem .3rem}pre{padding:1rem;overflow:auto;white-space:pre-wrap}table{border-collapse:collapse}td,th{border-bottom:1px solid #ddd;padding:.35rem .7rem;text-align:left}.ok{color:#067647}.bad{color:#b42318}</style>")
-	out.WriteString("</head><body><main><h1>Codex Window Keeper</h1><dl>")
-	writeDef(&out, "enabled", strconv.FormatBool(cfg.Enabled))
-	writeDef(&out, "timezone", cfg.Timezone)
-	writeDef(&out, "times", strings.Join(clockTimesToStrings(cfg.Times), ", "))
-	writeDef(&out, "model", cfg.Model)
-	writeDef(&out, "reasoning_effort", cfg.ReasoningEffort)
-	writeDef(&out, "state_dir", cfg.StateDir)
-	writeDef(&out, "codex_auths", authCount)
-	writeDef(&out, "attempts_recorded", strconv.Itoa(attemptCount))
-	out.WriteString("</dl>")
-	out.WriteString("<p><a href=\"?run=1\">Run once now</a></p>")
-	if summary.StartedAt != "" {
-		out.WriteString("<h2>Last Run</h2><pre>")
-		raw, _ := json.MarshalIndent(summary, "", "  ")
-		out.WriteString(html.EscapeString(string(raw)))
-		out.WriteString("</pre>")
+
+	enabledBadge := `<span class="badge bad">disabled</span>`
+	if cfg.Enabled {
+		enabledBadge = `<span class="badge ok">enabled</span>`
 	}
-	out.WriteString("</main></body></html>")
+
+	var out bytes.Buffer
+	out.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Window Keeper</title><style>`)
+	out.WriteString(statusPageCSS)
+	out.WriteString(`</style></head><body><main class="wrap"><header class="hd"><div><h1>Codex Window Keeper</h1><p class="sub">Pins each file-based Codex credential&#39;s 5h limit window to fixed daily slots.</p></div><span class="ver">v`)
+	out.WriteString(html.EscapeString(pluginVersion))
+	out.WriteString(`</span></header><section class="cards">`)
+	writeCard(&out, "Status", enabledBadge)
+	if authErr == "" {
+		writeCard(&out, "Codex credentials", html.EscapeString(authCount))
+	} else {
+		writeCard(&out, "Codex credentials", `<span class="badge bad">error</span>`)
+	}
+	writeCard(&out, "Timezone", html.EscapeString(cfg.Timezone))
+	writeCard(&out, "Model", html.EscapeString(cfg.Model))
+	writeCard(&out, "Reasoning effort", html.EscapeString(cfg.ReasoningEffort))
+	writeCard(&out, "Attempts recorded", strconv.Itoa(attemptCount))
+	out.WriteString(`</section>`)
+
+	if authErr != "" {
+		out.WriteString(`<p class="muted mono">auth list error: `)
+		out.WriteString(html.EscapeString(authErr))
+		out.WriteString(`</p>`)
+	}
+
+	out.WriteString(`<h2>Daily schedule</h2><div class="slots">`)
+	for _, t := range clockTimesToStrings(cfg.Times) {
+		out.WriteString(`<span class="slot">`)
+		out.WriteString(html.EscapeString(t))
+		out.WriteString(`</span>`)
+	}
+	out.WriteString(`</div><p class="muted mono">state_dir: `)
+	out.WriteString(html.EscapeString(cfg.StateDir))
+	out.WriteString(`</p><p class="action"><a class="btn" href="?run=1">Run once now</a><span class="hint">sends a real &quot;`)
+	out.WriteString(html.EscapeString(cfg.Prompt))
+	out.WriteString(`&quot; to each available credential</span></p><h2>Last run</h2>`)
+
+	if summary.StartedAt == "" {
+		out.WriteString(`<p class="muted">No run recorded yet.</p>`)
+	} else {
+		out.WriteString(`<p class="muted">slot <span class="mono">`)
+		out.WriteString(html.EscapeString(summary.Slot))
+		out.WriteString(`</span> &middot; started <span class="mono">`)
+		out.WriteString(html.EscapeString(fmtClockOrRaw(summary.StartedAt, loc)))
+		out.WriteString(`</span>`)
+		if summary.DryRun {
+			out.WriteString(` &middot; <span class="badge muted">dry run</span>`)
+		}
+		out.WriteString(`</p>`)
+		if len(summary.Results) == 0 {
+			out.WriteString(`<p class="muted">No per-credential results.</p>`)
+		} else {
+			out.WriteString(`<table><thead><tr><th>Credential</th><th>Status</th><th>Target</th><th>Sent / last try</th><th>Tries</th><th>Detail</th></tr></thead><tbody>`)
+			for _, r := range summary.Results {
+				sentOrLast := r.SentAt
+				if sentOrLast == "" {
+					sentOrLast = r.LastAttemptAt
+				}
+				out.WriteString(`<tr><td>`)
+				out.WriteString(html.EscapeString(displayAuthName(r)))
+				out.WriteString(`</td><td><span class="badge `)
+				out.WriteString(badgeClass(r.Status))
+				out.WriteString(`">`)
+				out.WriteString(html.EscapeString(r.Status))
+				out.WriteString(`</span></td><td class="mono">`)
+				out.WriteString(html.EscapeString(fmtClockOrRaw(r.TargetAt, loc)))
+				out.WriteString(`</td><td class="mono">`)
+				out.WriteString(html.EscapeString(fmtClockOrRaw(sentOrLast, loc)))
+				out.WriteString(`</td><td>`)
+				out.WriteString(strconv.Itoa(r.AttemptCount))
+				out.WriteString(`</td><td class="err">`)
+				out.WriteString(html.EscapeString(r.Error))
+				out.WriteString(`</td></tr>`)
+			}
+			out.WriteString(`</tbody></table>`)
+		}
+	}
+
+	out.WriteString(`</main></body></html>`)
 	return out.Bytes()
 }
 
-func writeDef(out *bytes.Buffer, key string, value string) {
-	out.WriteString("<dt>")
+const statusPageCSS = `:root{color-scheme:light dark}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1f2933;background:#f7f8fa}
+.wrap{max-width:920px;margin:0 auto;padding:2rem 1.25rem 3rem}
+.hd{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1.5rem}
+h1{font-size:1.6rem;margin:0 0 .25rem}
+h2{font-size:1.05rem;margin:2rem 0 .75rem;font-weight:600}
+.sub{margin:0;color:#6b7280}
+.ver{font:600 .75rem/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#6b7280;border:1px solid #d1d5db;border-radius:999px;padding:.35rem .6rem;white-space:nowrap}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.75rem}
+.card{border:1px solid #e5e7eb;border-radius:12px;padding:.8rem .9rem;background:#fff}
+.card .k{display:block;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:#6b7280;margin-bottom:.4rem}
+.card .v{font-size:1.05rem;font-weight:600;word-break:break-word}
+.badge{display:inline-block;font:600 .78rem/1.4 inherit;padding:.15rem .55rem;border-radius:999px}
+.badge.ok{background:#dcfce7;color:#067647}
+.badge.bad{background:#fee2e2;color:#b42318}
+.badge.warn{background:#fef3c7;color:#92400e}
+.badge.muted{background:#e5e7eb;color:#374151}
+.slots{display:flex;flex-wrap:wrap;gap:.5rem}
+.slot{font:600 .85rem/1 ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid #d1d5db;border-radius:8px;padding:.45rem .7rem;background:#fff}
+.action{margin-top:1.5rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.btn{display:inline-block;text-decoration:none;font-weight:600;background:#4f46e5;color:#fff;padding:.55rem 1rem;border-radius:10px}
+.btn:hover{background:#4338ca}
+.hint{color:#6b7280;font-size:.85rem}
+.muted{color:#6b7280}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
+table{width:100%;border-collapse:collapse;font-size:.9rem;margin-top:.25rem}
+th,td{text-align:left;padding:.55rem .6rem;border-bottom:1px solid #e5e7eb;vertical-align:top}
+th{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:#6b7280;font-weight:600}
+td.err{color:#b42318;max-width:340px;word-break:break-word;font-size:.82rem}
+@media (prefers-color-scheme:dark){
+body{color:#e5e7eb;background:#0f1216}
+.sub,.ver,.hint,.muted,.card .k,th{color:#9ca3af}
+.card,.slot{background:#161a20;border-color:#2a2f37}
+.ver,.slot{border-color:#2a2f37}
+th,td{border-color:#2a2f37}
+.badge.ok{background:#06351f;color:#4ade80}
+.badge.bad{background:#3f1417;color:#fca5a5}
+.badge.warn{background:#3a2c08;color:#fcd34d}
+.badge.muted{background:#23272e;color:#cbd5e1}
+td.err{color:#fca5a5}
+}`
+
+func writeCard(out *bytes.Buffer, key, valueHTML string) {
+	// valueHTML is trusted markup (a badge) or already HTML-escaped by the caller.
+	out.WriteString(`<div class="card"><span class="k">`)
 	out.WriteString(html.EscapeString(key))
-	out.WriteString("</dt><dd><code>")
-	out.WriteString(html.EscapeString(value))
-	out.WriteString("</code></dd>")
+	out.WriteString(`</span><span class="v">`)
+	out.WriteString(valueHTML)
+	out.WriteString(`</span></div>`)
+}
+
+func badgeClass(status string) string {
+	switch status {
+	case "sent", "skipped_sent":
+		return "ok"
+	case "attempting":
+		return "warn"
+	case "dry_run", "":
+		return "muted"
+	default:
+		return "bad"
+	}
+}
+
+func displayAuthName(r attemptRecord) string {
+	if strings.TrimSpace(r.AuthName) != "" {
+		return r.AuthName
+	}
+	if strings.TrimSpace(r.AuthID) != "" {
+		return r.AuthID
+	}
+	return "(unknown)"
+}
+
+func fmtClockOrRaw(rfc3339 string, loc *time.Location) string {
+	if strings.TrimSpace(rfc3339) == "" {
+		return "—"
+	}
+	if t, err := time.Parse(time.RFC3339, rfc3339); err == nil {
+		return t.In(loc).Format("01-02 15:04:05")
+	}
+	return rfc3339
 }
 
 func currentConfig() pluginConfig {
