@@ -69,6 +69,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -329,9 +330,10 @@ type runSummary struct {
 }
 
 var (
-	cfgMu      sync.RWMutex
-	activeCfg  = defaultConfig()
-	loopCancel context.CancelFunc
+	cfgMu          sync.RWMutex
+	activeCfg      = defaultConfig()
+	configuredOnce bool
+	loopCancel     context.CancelFunc
 
 	runMu       sync.Mutex
 	stateMu     sync.Mutex
@@ -433,12 +435,26 @@ func configure(raw []byte) error {
 	}
 	cfg.normalize()
 
+	// The host re-applies plugin config whenever a watched auth file changes, and
+	// every keepalive writes an auth file (priority bump/restore, plus the host's
+	// own per-execution persist). Restarting the schedule loop on those spurious
+	// reconfigures re-fires the current slot during its minute -> another keepalive
+	// -> another auth-file write -> another reconfigure: a runaway loop. So when the
+	// effective config is unchanged, do nothing.
+	cfgMu.Lock()
+	unchanged := configuredOnce && reflect.DeepEqual(cfg, activeCfg)
+	cfgMu.Unlock()
+	if unchanged {
+		return nil
+	}
+
 	stopLoop()
 	if err := loadState(cfg.StateDir); err != nil {
 		hostLog("warn", "codex-window-keeper state load failed", map[string]any{"error": err.Error()})
 	}
 	cfgMu.Lock()
 	activeCfg = cfg
+	configuredOnce = true
 	cfgMu.Unlock()
 	if cfg.Enabled {
 		startLoop(cfg)
@@ -1225,7 +1241,8 @@ func setAuthPriority(ctx context.Context, cfg pluginConfig, authID string, prior
 	}
 	defer resp.Body.Close()
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
-	// Drain any remainder so the keep-alive connection can be reused.
+	// Drain the remainder so the connection closes cleanly (the client is fresh
+	// per call and its idle connections are closed on return).
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("management priority patch returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))

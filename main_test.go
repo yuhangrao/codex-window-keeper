@@ -486,6 +486,91 @@ func TestWarmAuthRaiseFailureKeepsBumpRecord(t *testing.T) {
 	}
 }
 
+func TestConfigureNoOpWhenUnchanged(t *testing.T) {
+	cfgMu.Lock()
+	configuredOnce = false
+	activeCfg = defaultConfig()
+	cfgMu.Unlock()
+	t.Cleanup(func() {
+		cfgMu.Lock()
+		configuredOnce = false
+		activeCfg = defaultConfig()
+		cfgMu.Unlock()
+	})
+	dir := t.TempDir()
+	raw := mustMarshal(t, lifecycleRequest{ConfigYAML: []byte("enabled: false\nstate_dir: \"" + dir + "\"\n")})
+	if err := configure(raw); err != nil {
+		t.Fatal(err)
+	}
+	stateMu.Lock()
+	first := statePath
+	statePath = "SENTINEL"
+	stateMu.Unlock()
+	if first == "" {
+		t.Fatal("first configure should set statePath via loadState")
+	}
+	// An identical reconfigure (e.g. one the host fires after an auth-file write)
+	// must be a no-op: it must not re-run loadState, so the sentinel survives.
+	if err := configure(raw); err != nil {
+		t.Fatal(err)
+	}
+	stateMu.Lock()
+	afterNoop := statePath
+	stateMu.Unlock()
+	if afterNoop != "SENTINEL" {
+		t.Fatalf("identical reconfigure must be a no-op; statePath = %q, want SENTINEL", afterNoop)
+	}
+	// A changed config must apply (re-run loadState, overwriting the sentinel).
+	raw2 := mustMarshal(t, lifecycleRequest{ConfigYAML: []byte("enabled: false\nmodel: \"gpt-5.5\"\nstate_dir: \"" + dir + "\"\n")})
+	if err := configure(raw2); err != nil {
+		t.Fatal(err)
+	}
+	stateMu.Lock()
+	afterChange := statePath
+	stateMu.Unlock()
+	if afterChange == "SENTINEL" {
+		t.Fatal("a changed config must apply (loadState should overwrite statePath)")
+	}
+}
+
+func TestWarmAuthRestoresAfterFailedSend(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	rr := &mgmtRecorder{} // 200 OK for both raise and restore
+	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
+	defer srv.Close()
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = srv.URL
+	cfg.ManagementKey = "k"
+	cfg.ManagementCACert = writeServerCA(t, srv)
+	cfg.BumpPriority = 10
+	auth := authEntry{ID: "codex-low.json", Name: "codex-low.json", Priority: 8}
+	// The raise succeeds; the warm (sendHi) fails because no host is wired. The
+	// deferred restore must still run and clear the bump record.
+	if err := warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 9); err == nil {
+		t.Fatal("expected a send error (no host wired)")
+	}
+	if len(pendingBumps()) != 0 {
+		t.Fatalf("deferred restore must clear the bump even when the warm fails; got %#v", pendingBumps())
+	}
+	rr.mu.Lock()
+	calls, body := rr.calls, rr.body
+	rr.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("expected raise + restore (2 calls), got %d", calls)
+	}
+	var decoded struct {
+		Priority int `json:"priority"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("restore body not json: %v (%s)", err, body)
+	}
+	if decoded.Priority != 8 {
+		t.Fatalf("final restore priority = %d, want 8 (original)", decoded.Priority)
+	}
+}
+
 func mustParseNominalSlotForTest(t *testing.T, slot string, loc *time.Location) time.Time {
 	t.Helper()
 	nominalAt, ok := parseNominalSlot(slot, loc)
