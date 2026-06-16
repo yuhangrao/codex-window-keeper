@@ -491,6 +491,10 @@ func TestConfigureNoOpWhenUnchanged(t *testing.T) {
 	configuredOnce = false
 	activeCfg = defaultConfig()
 	cfgMu.Unlock()
+	// configure() starts reconcileLoop (which runs even while disabled); cancel
+	// it when the test ends. Registered separately from the global-reset cleanup
+	// below because stopLoop takes cfgMu, which that cleanup already holds.
+	t.Cleanup(stopLoop)
 	t.Cleanup(func() {
 		cfgMu.Lock()
 		configuredOnce = false
@@ -568,6 +572,75 @@ func TestWarmAuthRestoresAfterFailedSend(t *testing.T) {
 	}
 	if decoded.Priority != 8 {
 		t.Fatalf("final restore priority = %d, want 8 (original)", decoded.Priority)
+	}
+}
+
+func TestRecordBumpFirstWriteWins(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordBump("codex-x.json", 8); err != nil {
+		t.Fatal(err)
+	}
+	// A second record (e.g. a re-bump after a prior restore failed and left the
+	// entry) must NOT overwrite the true original (8) with the already-raised
+	// value (10), or a later restore would land on the wrong priority.
+	if err := recordBump("codex-x.json", 10); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingBumps()["codex-x.json"]; got != 8 {
+		t.Fatalf("recordBump must keep the first (true original) priority; got %d, want 8", got)
+	}
+}
+
+func TestClearRunningOnlyClearsOwnSlot(t *testing.T) {
+	t.Cleanup(func() { setRunning("") })
+	setRunning("slot-A")
+	// A newer manual run overwrote the indicator; an older run finishing must
+	// not clear the newer slot (which would show the page idle mid-run).
+	clearRunning("slot-B")
+	if got := getRunning(); got != "slot-A" {
+		t.Fatalf("clearRunning(other) must not clear a newer slot; got %q, want slot-A", got)
+	}
+	clearRunning("slot-A")
+	if got := getRunning(); got != "" {
+		t.Fatalf("clearRunning(own) must clear; got %q, want empty", got)
+	}
+}
+
+func TestConfigureNoOpAfterShutdown(t *testing.T) {
+	cfgMu.Lock()
+	configuredOnce = false
+	activeCfg = defaultConfig()
+	cfgMu.Unlock()
+	configureMu.Lock()
+	shuttingDown = false
+	configureMu.Unlock()
+	t.Cleanup(stopLoop)
+	t.Cleanup(func() {
+		configureMu.Lock()
+		shuttingDown = false
+		configureMu.Unlock()
+		cfgMu.Lock()
+		configuredOnce = false
+		activeCfg = defaultConfig()
+		cfgMu.Unlock()
+	})
+
+	// Simulate host teardown, then a configure() arriving afterward. It must be
+	// a no-op: no loop (re)start, no active-config mutation. The host should not
+	// reconfigure-after-shutdown, but we do not rely on host ordering.
+	cliproxyPluginShutdown()
+	dir := t.TempDir()
+	raw := mustMarshal(t, lifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_dir: \"" + dir + "\"\n")})
+	if err := configure(raw); err != nil {
+		t.Fatal(err)
+	}
+	cfgMu.RLock()
+	once := configuredOnce
+	cfgMu.RUnlock()
+	if once {
+		t.Fatal("configure after shutdown must be a no-op (configuredOnce should stay false)")
 	}
 }
 

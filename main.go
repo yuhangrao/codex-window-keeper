@@ -334,7 +334,8 @@ var (
 	activeCfg      = defaultConfig()
 	configuredOnce bool
 	loopCancel     context.CancelFunc
-	configureMu    sync.Mutex // serializes configure() so concurrent (re)configures can't leak schedule loops
+	configureMu    sync.Mutex // serializes configure()/shutdown so they can't leak schedule loops; read/written only under it
+	shuttingDown   bool       // set once shutdown begins; guarded by configureMu so a racing configure won't (re)start loops after teardown
 
 	runMu       sync.Mutex
 	stateMu     sync.Mutex
@@ -396,6 +397,15 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	// Hold configureMu across the teardown so a concurrent configure() cannot
+	// interleave its stopLoop()->startLoop() with ours and strand goroutines
+	// that nothing then cancels. The shuttingDown flag makes a configure() that
+	// arrives after teardown a no-op (the host should not reconfigure-after-
+	// shutdown, but we do not rely on host ordering — same rationale as
+	// configureMu itself).
+	configureMu.Lock()
+	defer configureMu.Unlock()
+	shuttingDown = true
 	stopLoop()
 }
 
@@ -424,6 +434,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 func configure(raw []byte) error {
 	configureMu.Lock()
 	defer configureMu.Unlock()
+	if shuttingDown {
+		// The plugin is being torn down; do not (re)start any loop.
+		return nil
+	}
 	cfg := defaultConfig()
 	var req lifecycleRequest
 	if len(raw) > 0 {
@@ -763,7 +777,7 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 	runMu.Lock()
 	defer runMu.Unlock()
 	setRunning(slot)
-	defer setRunning("")
+	defer clearRunning(slot)
 
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	summary := runSummary{Slot: slot, StartedAt: startedAt, DryRun: cfg.DryRun}
@@ -1627,12 +1641,19 @@ func updateAttempt(key string, record attemptRecord) error {
 }
 
 // recordBump durably remembers an auth's original priority before the plugin
-// raises it, so a crash before restore can be reconciled later.
+// raises it, so a crash before restore can be reconciled later. First write
+// wins: if an entry already exists (a prior restore failed and left it), that
+// entry holds the true original, so it must not be overwritten with the
+// already-raised priority — otherwise a later restore would land on the wrong
+// value.
 func recordBump(authID string, originalPriority int) error {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	if keeperState.Bumps == nil {
 		keeperState.Bumps = map[string]int{}
+	}
+	if _, exists := keeperState.Bumps[authID]; exists {
+		return nil
 	}
 	keeperState.Bumps[authID] = originalPriority
 	return saveStateLocked()
@@ -1763,6 +1784,19 @@ func setLastSummary(summary runSummary) {
 func setRunning(slot string) {
 	runningMu.Lock()
 	runningSlot = slot
+	runningMu.Unlock()
+}
+
+// clearRunning clears the running indicator only if it still names this slot.
+// A manual run is pre-marked running by handleManagement before its goroutine
+// starts; if a newer ?run=1 arrives and overwrites the slot while this run is
+// finishing, this run must not clear the newer slot (which would briefly show
+// the page as idle while a run is still queued/active).
+func clearRunning(slot string) {
+	runningMu.Lock()
+	if runningSlot == slot {
+		runningSlot = ""
+	}
 	runningMu.Unlock()
 }
 
