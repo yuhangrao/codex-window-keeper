@@ -298,8 +298,9 @@ type managementResponse struct {
 type stateFile struct {
 	Attempts map[string]attemptRecord `json:"attempts"`
 	// Bumps maps an auth ID to the priority it had before the plugin temporarily
-	// raised it. A non-empty entry means a restore is owed (used to recover from
-	// a crash between raising and restoring a priority).
+	// raised it. The presence of an entry means a restore is owed (the recorded
+	// value may legitimately be 0, the default priority); used to recover from a
+	// crash between raising and restoring a priority.
 	Bumps map[string]int `json:"bumps,omitempty"`
 }
 
@@ -696,7 +697,11 @@ func startLoop(cfg pluginConfig) {
 		}
 		rctx, rcancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer rcancel()
+		// Hold runMu so this never restores an auth that an active run is mid-warm
+		// on (the run owns its in-flight bumps and reconciles its own leftovers).
+		runMu.Lock()
 		reconcileBumps(rctx, cfg)
+		runMu.Unlock()
 	}()
 	if cfg.StartupRun {
 		go runSlot(context.Background(), cfg, "startup", true)
@@ -769,8 +774,8 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 	// The host offers only the highest-priority tier as scheduler candidates;
 	// auths below this need a temporary priority bump to be warmable.
 	topPriority := 0
-	for _, auth := range auths {
-		if auth.Priority > topPriority {
+	for i, auth := range auths {
+		if i == 0 || auth.Priority > topPriority {
 			topPriority = auth.Priority
 		}
 	}
@@ -1120,7 +1125,12 @@ func warmAuth(ctx context.Context, cfg pluginConfig, slot string, auth authEntry
 		return fmt.Errorf("persist bump state: %w", err)
 	}
 	if err := setAuthPriority(ctx, cfg, auth.ID, bumpTarget); err != nil {
-		_ = clearBump(auth.ID)
+		// The raise may have applied on the host before the error surfaced (e.g.
+		// an in-memory change followed by a persist failure). Attempt an immediate
+		// restore; restoreAuthPriority keeps the bump record if that also fails, so
+		// reconcileBumps can still recover it. Never drop the record on a failed
+		// raise.
+		restoreAuthPriority(cfg, auth.ID, auth.Priority)
 		return fmt.Errorf("raise priority: %w", err)
 	}
 	defer restoreAuthPriority(cfg, auth.ID, auth.Priority)
@@ -1141,7 +1151,8 @@ func restoreAuthPriority(cfg pluginConfig, authID string, original int) {
 }
 
 // reconcileBumps restores any priorities the plugin raised but did not restore
-// (e.g. a crash between raise and restore). Safe to call repeatedly.
+// (e.g. a crash between raise and restore). Safe to call repeatedly. Callers
+// must hold runMu so it cannot race an active warmAuth's bump/restore.
 func reconcileBumps(ctx context.Context, cfg pluginConfig) {
 	bumps := pendingBumps()
 	if len(bumps) == 0 {
@@ -1163,7 +1174,9 @@ func reconcileBumps(ctx context.Context, cfg pluginConfig) {
 
 // setAuthPriority patches one auth's priority through the CLIProxyAPI management
 // API. The host applies it immediately and re-persists the auth from its own
-// current in-memory tokens, so this does not clobber a concurrent token refresh.
+// current in-memory tokens (not a stale plugin snapshot or a disk re-read), so
+// the only token-clobber window is a sub-millisecond read-modify-write inside
+// the host — far smaller than rewriting the auth file ourselves, but not zero.
 func setAuthPriority(ctx context.Context, cfg pluginConfig, authID string, priority int) error {
 	if cfg.ManagementKey == "" {
 		return fmt.Errorf("management_key is not configured")
@@ -1182,6 +1195,8 @@ func setAuthPriority(ctx context.Context, cfg pluginConfig, authID string, prior
 	}
 	defer resp.Body.Close()
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+	// Drain any remainder so the keep-alive connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("management priority patch returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
@@ -1219,6 +1234,9 @@ func managementHTTPClient(cfg pluginConfig) (*http.Client, error) {
 	defer mgmtClientMu.Unlock()
 	if mgmtClient != nil && mgmtClientCA == cfg.ManagementCACert {
 		return mgmtClient, nil
+	}
+	if mgmtClient != nil {
+		mgmtClient.CloseIdleConnections()
 	}
 	pem, err := os.ReadFile(cfg.ManagementCACert)
 	if err != nil {

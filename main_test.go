@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -312,7 +316,9 @@ func TestWarmAuthTopTierDoesNotBump(t *testing.T) {
 	auth := authEntry{ID: "codex-top.json", Name: "codex-top.json", Priority: 10}
 	// No host is wired in unit tests, so the underlying send fails — the point is
 	// that a top-tier auth is warmed directly and never recorded as a bump.
-	_ = warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 10)
+	if err := warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 10); err == nil {
+		t.Fatal("expected an error from the direct send (no host wired), got nil")
+	}
 	if len(pendingBumps()) != 0 {
 		t.Fatalf("top-tier auth must not be bumped, got %#v", pendingBumps())
 	}
@@ -331,6 +337,135 @@ func TestListCodexAuthsFromDirReadsPriority(t *testing.T) {
 	}
 	if len(auths) != 1 || auths[0].Priority != 8 {
 		t.Fatalf("expected priority 8 read from file, got %#v", auths)
+	}
+}
+
+// mgmtRecorder is a test double for the CLIProxyAPI management API.
+type mgmtRecorder struct {
+	mu     sync.Mutex
+	method string
+	path   string
+	auth   string
+	body   []byte
+	calls  int
+	status int // response status to send (0 -> 200)
+}
+
+func (rr *mgmtRecorder) handler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	rr.mu.Lock()
+	rr.method, rr.path, rr.auth, rr.body = r.Method, r.URL.Path, r.Header.Get("Authorization"), body
+	rr.calls++
+	status := rr.status
+	rr.mu.Unlock()
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	if status == http.StatusOK {
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}
+}
+
+func writeServerCA(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return caPath
+}
+
+func TestSetAuthPriorityViaServer(t *testing.T) {
+	rr := &mgmtRecorder{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
+	defer srv.Close()
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = srv.URL
+	cfg.ManagementKey = "k"
+	cfg.ManagementCACert = writeServerCA(t, srv)
+	if err := setAuthPriority(context.Background(), cfg, "codex-a.json", 10); err != nil {
+		t.Fatal(err)
+	}
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.method != http.MethodPatch || rr.path != managementAuthFieldsPath || rr.auth != "Bearer k" {
+		t.Fatalf("unexpected request: %s %s auth=%q", rr.method, rr.path, rr.auth)
+	}
+	var decoded struct {
+		Name     string `json:"name"`
+		Priority int    `json:"priority"`
+	}
+	if err := json.Unmarshal(rr.body, &decoded); err != nil {
+		t.Fatalf("body not json: %v (%s)", err, rr.body)
+	}
+	if decoded.Name != "codex-a.json" || decoded.Priority != 10 {
+		t.Fatalf("unexpected body: %s", rr.body)
+	}
+}
+
+func TestSetAuthPriorityNon200Errors(t *testing.T) {
+	rr := &mgmtRecorder{status: http.StatusForbidden}
+	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
+	defer srv.Close()
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = srv.URL
+	cfg.ManagementKey = "k"
+	cfg.ManagementCACert = writeServerCA(t, srv)
+	if err := setAuthPriority(context.Background(), cfg, "codex-a.json", 10); err == nil {
+		t.Fatal("expected error on non-200 response")
+	}
+}
+
+func TestReconcileBumpsRestoresAndClears(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	rr := &mgmtRecorder{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
+	defer srv.Close()
+	if err := recordBump("codex-a.json", 8); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = srv.URL
+	cfg.ManagementKey = "k"
+	cfg.ManagementCACert = writeServerCA(t, srv)
+	reconcileBumps(context.Background(), cfg)
+	rr.mu.Lock()
+	calls := rr.calls
+	rr.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected 1 restore PATCH, got %d", calls)
+	}
+	if len(pendingBumps()) != 0 {
+		t.Fatal("bump must be cleared after a successful restore")
+	}
+}
+
+func TestWarmAuthRaiseFailureKeepsBumpRecord(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	rr := &mgmtRecorder{status: http.StatusInternalServerError}
+	srv := httptest.NewTLSServer(http.HandlerFunc(rr.handler))
+	defer srv.Close()
+	cfg := defaultConfig()
+	cfg.ManagementBaseURL = srv.URL
+	cfg.ManagementKey = "k"
+	cfg.ManagementCACert = writeServerCA(t, srv)
+	cfg.BumpPriority = 10
+	auth := authEntry{ID: "codex-low.json", Name: "codex-low.json", Priority: 8}
+	err := warmAuth(context.Background(), cfg, "2026-06-16 07:00", auth, 9)
+	if err == nil || !strings.Contains(err.Error(), "raise priority") {
+		t.Fatalf("expected raise-priority error, got %v", err)
+	}
+	// A failed raise must keep the bump record so reconcileBumps can recover it.
+	if _, ok := pendingBumps()["codex-low.json"]; !ok {
+		t.Fatal("bump record must be retained after a failed raise")
 	}
 }
 
