@@ -193,6 +193,44 @@ func TestListCodexAuthsFromDirFallback(t *testing.T) {
 	}
 }
 
+func TestKeepaliveBodyInputIsListWithoutMetadata(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Prompt = "hi"
+	body, err := keepaliveBody(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The codex exit protocol requires `input` as a list and rejects a
+	// `metadata` field ("Unsupported parameter: metadata").
+	var decoded struct {
+		Input []struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"input"`
+		Metadata json.RawMessage `json:"metadata"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("keepalive body is not valid json: %v (%s)", err, body)
+	}
+	if decoded.Metadata != nil {
+		t.Fatalf("keepalive body must not send metadata: %s", body)
+	}
+	if len(decoded.Input) != 1 {
+		t.Fatalf("input must be a non-empty list, got %d: %s", len(decoded.Input), body)
+	}
+	item := decoded.Input[0]
+	if item.Type != "message" || item.Role != "user" || len(item.Content) != 1 {
+		t.Fatalf("unexpected input item shape: %s", body)
+	}
+	if item.Content[0].Type != "input_text" || item.Content[0].Text != "hi" {
+		t.Fatalf("unexpected input content: %s", body)
+	}
+}
+
 func mustParseNominalSlotForTest(t *testing.T, slot string, loc *time.Location) time.Time {
 	t.Helper()
 	nominalAt, ok := parseNominalSlot(slot, loc)

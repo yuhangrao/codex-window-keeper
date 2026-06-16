@@ -229,11 +229,25 @@ type hostModelExecutionResponse struct {
 }
 
 type responsesRequest struct {
-	Model     string         `json:"model"`
-	Input     string         `json:"input"`
-	Reasoning map[string]any `json:"reasoning,omitempty"`
-	Store     bool           `json:"store"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
+	Model     string               `json:"model"`
+	Input     []responsesInputItem `json:"input"`
+	Reasoning map[string]any       `json:"reasoning,omitempty"`
+	Store     bool                 `json:"store"`
+}
+
+// responsesInputItem is one entry in the Responses API `input` array. The codex
+// exit protocol requires `input` to be a list of structured items; a bare
+// string is forwarded unchanged and rejected upstream with
+// {"detail":"Input must be a list"}.
+type responsesInputItem struct {
+	Type    string                 `json:"type"`
+	Role    string                 `json:"role"`
+	Content []responsesContentPart `json:"content"`
+}
+
+type responsesContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type hostLogRequest struct {
@@ -925,7 +939,7 @@ func isCodexFileAuth(entry authEntry) bool {
 }
 
 func sendHi(ctx context.Context, cfg pluginConfig, slot string, auth authEntry) error {
-	body, err := keepaliveBody(cfg, slot, auth)
+	body, err := keepaliveBody(cfg)
 	if err != nil {
 		return err
 	}
@@ -961,16 +975,19 @@ func sendHi(ctx context.Context, cfg pluginConfig, slot string, auth authEntry) 
 	return nil
 }
 
-func keepaliveBody(cfg pluginConfig, slot string, auth authEntry) ([]byte, error) {
+func keepaliveBody(cfg pluginConfig) ([]byte, error) {
+	// The codex backend rejects a `metadata` field ("Unsupported parameter:
+	// metadata"), so keepalive traceability lives in the request headers
+	// (marker, target auth, session/idempotency keys) and the state file, not
+	// in the body.
 	req := responsesRequest{
 		Model: cfg.Model,
-		Input: cfg.Prompt,
+		Input: []responsesInputItem{{
+			Type:    "message",
+			Role:    "user",
+			Content: []responsesContentPart{{Type: "input_text", Text: cfg.Prompt}},
+		}},
 		Store: false,
-		Metadata: map[string]any{
-			"codex_window_keeper": true,
-			"slot":                slot,
-			"auth_id_hash":        shortHash(auth.ID),
-		},
 	}
 	if cfg.ReasoningEffort != "" {
 		req.Reasoning = map[string]any{"effort": cfg.ReasoningEffort}
