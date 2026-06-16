@@ -1165,12 +1165,18 @@ func renderStatusPage() []byte {
 				if sentOrLast == "" {
 					sentOrLast = r.LastAttemptAt
 				}
+				// While the run is active, a failed-but-pending account is still
+				// being retried; show "retrying" rather than a terminal "failed".
+				status := r.Status
+				if running != "" && status == "failed" {
+					status = "retrying"
+				}
 				out.WriteString(`<tr><td>`)
 				out.WriteString(html.EscapeString(displayAuthName(r)))
 				out.WriteString(`</td><td><span class="badge `)
-				out.WriteString(badgeClass(r.Status))
+				out.WriteString(badgeClass(status))
 				out.WriteString(`">`)
-				out.WriteString(html.EscapeString(r.Status))
+				out.WriteString(html.EscapeString(status))
 				out.WriteString(`</span></td><td class="mono">`)
 				out.WriteString(html.EscapeString(fmtClockOrRaw(r.TargetAt, loc)))
 				out.WriteString(`</td><td class="mono">`)
@@ -1245,7 +1251,7 @@ func badgeClass(status string) string {
 	switch status {
 	case "sent", "skipped_sent":
 		return "ok"
-	case "attempting":
+	case "attempting", "retrying":
 		return "warn"
 	case "dry_run", "":
 		return "muted"
