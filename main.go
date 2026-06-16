@@ -88,7 +88,7 @@ const (
 	methodHostLog            = "host.log"
 
 	pluginID      = "codex-window-keeper"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.3.0"
 
 	defaultTargetHeader = "X-Codex-Window-Keeper-Target-Auth"
 	defaultMarkerHeader = "X-Codex-Window-Keeper"
@@ -315,6 +315,9 @@ var (
 
 	lastSummaryMu sync.Mutex
 	lastSummary   runSummary
+
+	runningMu   sync.Mutex
+	runningSlot string // non-empty while a runSlot is active; drives the status-page live refresh
 )
 
 func main() {}
@@ -680,6 +683,8 @@ func scheduleLoop(ctx context.Context, cfg pluginConfig) {
 func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool) {
 	runMu.Lock()
 	defer runMu.Unlock()
+	setRunning(slot)
+	defer setRunning("")
 
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	summary := runSummary{Slot: slot, StartedAt: startedAt, DryRun: cfg.DryRun}
@@ -1031,7 +1036,15 @@ func handleManagement(raw []byte) ([]byte, error) {
 	queryRun := queryGet(req.Query, "run")
 	if queryRun == "1" || strings.EqualFold(queryRun, "true") {
 		cfg := currentConfig()
-		go runSlot(context.Background(), cfg, "manual-"+time.Now().In(mustLocation(cfg.Timezone)).Format("2006-01-02 15:04:05"), true)
+		slot := "manual-" + time.Now().In(mustLocation(cfg.Timezone)).Format("2006-01-02 15:04:05")
+		setRunning(slot)
+		go runSlot(context.Background(), cfg, slot, true)
+		// Redirect to the query-less page so the browser (and its auto-refresh)
+		// shows live progress without re-triggering the run on every reload.
+		return okEnvelope(managementResponse{
+			StatusCode: http.StatusSeeOther,
+			Headers:    map[string][]string{"Location": {"status"}},
+		})
 	}
 	page := renderStatusPage()
 	return okEnvelope(managementResponse{
@@ -1044,6 +1057,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 func renderStatusPage() []byte {
 	cfg := currentConfig()
 	summary := getLastSummary()
+	running := getRunning()
 	loc := mustLocation(cfg.Timezone)
 	stateMu.Lock()
 	attemptCount := len(keeperState.Attempts)
@@ -1065,7 +1079,13 @@ func renderStatusPage() []byte {
 	}
 
 	var out bytes.Buffer
-	out.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Window Keeper</title><style>`)
+	out.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">`)
+	if running != "" {
+		// Auto-refresh to the query-less path while a run is active so progress
+		// streams in; stops once the run finishes and the flag clears.
+		out.WriteString(`<meta http-equiv="refresh" content="3;url=status">`)
+	}
+	out.WriteString(`<title>Codex Window Keeper</title><style>`)
 	out.WriteString(statusPageCSS)
 	out.WriteString(`</style></head><body><main class="wrap"><header class="hd"><div><h1>Codex Window Keeper</h1><p class="sub">Pins each file-based Codex credential&#39;s 5h limit window to fixed daily slots.</p></div><span class="ver">v`)
 	out.WriteString(html.EscapeString(pluginVersion))
@@ -1098,25 +1118,49 @@ func renderStatusPage() []byte {
 	out.WriteString(html.EscapeString(cfg.StateDir))
 	out.WriteString(`</p><p class="action"><a class="btn" href="?run=1">Run once now</a><span class="hint">sends a real &quot;`)
 	out.WriteString(html.EscapeString(cfg.Prompt))
-	out.WriteString(`&quot; to each available credential</span></p><h2>Last run</h2>`)
+	out.WriteString(`&quot; to each available credential</span></p>`)
 
-	if summary.StartedAt == "" {
+	// Run section: live view (from persisted attempts) while a run is active,
+	// otherwise the last completed run summary.
+	var runSlotName, runStarted string
+	var results []attemptRecord
+	dryRun := false
+	if running != "" {
+		out.WriteString(`<h2>Current run <span class="badge warn">running…</span></h2>`)
+		runSlotName = running
+		results = attemptsForSlot(running)
+		if len(results) > 0 {
+			runStarted = results[0].StartedAt
+		}
+		dryRun = cfg.DryRun
+	} else {
+		out.WriteString(`<h2>Last run</h2>`)
+		runSlotName = summary.Slot
+		runStarted = summary.StartedAt
+		results = summary.Results
+		dryRun = summary.DryRun
+	}
+
+	if runSlotName == "" {
 		out.WriteString(`<p class="muted">No run recorded yet.</p>`)
 	} else {
 		out.WriteString(`<p class="muted">slot <span class="mono">`)
-		out.WriteString(html.EscapeString(summary.Slot))
-		out.WriteString(`</span> &middot; started <span class="mono">`)
-		out.WriteString(html.EscapeString(fmtClockOrRaw(summary.StartedAt, loc)))
+		out.WriteString(html.EscapeString(runSlotName))
 		out.WriteString(`</span>`)
-		if summary.DryRun {
+		if runStarted != "" {
+			out.WriteString(` &middot; started <span class="mono">`)
+			out.WriteString(html.EscapeString(fmtClockOrRaw(runStarted, loc)))
+			out.WriteString(`</span>`)
+		}
+		if dryRun {
 			out.WriteString(` &middot; <span class="badge muted">dry run</span>`)
 		}
 		out.WriteString(`</p>`)
-		if len(summary.Results) == 0 {
-			out.WriteString(`<p class="muted">No per-credential results.</p>`)
+		if len(results) == 0 {
+			out.WriteString(`<p class="muted">Starting&hellip;</p>`)
 		} else {
 			out.WriteString(`<table><thead><tr><th>Credential</th><th>Status</th><th>Target</th><th>Sent / last try</th><th>Tries</th><th>Detail</th></tr></thead><tbody>`)
-			for _, r := range summary.Results {
+			for _, r := range results {
 				sentOrLast := r.SentAt
 				if sentOrLast == "" {
 					sentOrLast = r.LastAttemptAt
@@ -1379,6 +1423,36 @@ func setLastSummary(summary runSummary) {
 	lastSummaryMu.Lock()
 	lastSummary = summary
 	lastSummaryMu.Unlock()
+}
+
+func setRunning(slot string) {
+	runningMu.Lock()
+	runningSlot = slot
+	runningMu.Unlock()
+}
+
+func getRunning() string {
+	runningMu.Lock()
+	defer runningMu.Unlock()
+	return runningSlot
+}
+
+// attemptsForSlot returns the persisted attempt records for one slot, sorted by
+// credential name. It backs the live run view, which reads current state on
+// every page refresh instead of waiting for the run to finish.
+func attemptsForSlot(slot string) []attemptRecord {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	out := make([]attemptRecord, 0, len(keeperState.Attempts))
+	for _, record := range keeperState.Attempts {
+		if record.Slot == slot {
+			out = append(out, record)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].AuthName) < strings.ToLower(out[j].AuthName)
+	})
+	return out
 }
 
 func getLastSummary() runSummary {
