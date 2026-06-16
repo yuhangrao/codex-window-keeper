@@ -415,8 +415,8 @@ func TestSetAuthPriorityNon200Errors(t *testing.T) {
 	cfg.ManagementBaseURL = srv.URL
 	cfg.ManagementKey = "k"
 	cfg.ManagementCACert = writeServerCA(t, srv)
-	if err := setAuthPriority(context.Background(), cfg, "codex-a.json", 10); err == nil {
-		t.Fatal("expected error on non-200 response")
+	if err := setAuthPriority(context.Background(), cfg, "codex-a.json", 10); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expected error mentioning status 403, got %v", err)
 	}
 }
 
@@ -437,9 +437,19 @@ func TestReconcileBumpsRestoresAndClears(t *testing.T) {
 	reconcileBumps(context.Background(), cfg)
 	rr.mu.Lock()
 	calls := rr.calls
+	body := rr.body
 	rr.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected 1 restore PATCH, got %d", calls)
+	}
+	var decoded struct {
+		Priority int `json:"priority"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("restore body not json: %v (%s)", err, body)
+	}
+	if decoded.Priority != 8 {
+		t.Fatalf("restored priority = %d, want 8", decoded.Priority)
 	}
 	if len(pendingBumps()) != 0 {
 		t.Fatal("bump must be cleared after a successful restore")
@@ -466,6 +476,13 @@ func TestWarmAuthRaiseFailureKeepsBumpRecord(t *testing.T) {
 	// A failed raise must keep the bump record so reconcileBumps can recover it.
 	if _, ok := pendingBumps()["codex-low.json"]; !ok {
 		t.Fatal("bump record must be retained after a failed raise")
+	}
+	// And it must still attempt an inline revert (raise + revert == 2 calls).
+	rr.mu.Lock()
+	calls := rr.calls
+	rr.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("expected raise + inline revert attempt (2 calls), got %d", calls)
 	}
 }
 

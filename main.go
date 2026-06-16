@@ -100,6 +100,10 @@ const (
 	// individual auth-file fields (used here to temporarily raise an auth's
 	// priority so the host's selection will route a keepalive to it).
 	managementAuthFieldsPath = "/v0/management/auth-files/fields"
+
+	// reconcileInterval bounds how long a failed priority restore can persist
+	// before the background reconcile loop retries it.
+	reconcileInterval = 10 * time.Minute
 )
 
 type envelope struct {
@@ -687,22 +691,7 @@ func startLoop(cfg pluginConfig) {
 	loopCancel = cancel
 	cfgMu.Unlock()
 	go scheduleLoop(ctx, cfg)
-	// Recover any leftover priority bumps shortly after (re)start — once the
-	// host's management listener is up — instead of waiting for the next slot.
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(20 * time.Second):
-		}
-		rctx, rcancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer rcancel()
-		// Hold runMu so this never restores an auth that an active run is mid-warm
-		// on (the run owns its in-flight bumps and reconciles its own leftovers).
-		runMu.Lock()
-		reconcileBumps(rctx, cfg)
-		runMu.Unlock()
-	}()
+	go reconcileLoop(ctx, cfg)
 	if cfg.StartupRun {
 		go runSlot(context.Background(), cfg, "startup", true)
 	}
@@ -1125,29 +1114,37 @@ func warmAuth(ctx context.Context, cfg pluginConfig, slot string, auth authEntry
 		return fmt.Errorf("persist bump state: %w", err)
 	}
 	if err := setAuthPriority(ctx, cfg, auth.ID, bumpTarget); err != nil {
-		// The raise may have applied on the host before the error surfaced (e.g.
-		// an in-memory change followed by a persist failure). Attempt an immediate
-		// restore; restoreAuthPriority keeps the bump record if that also fails, so
-		// reconcileBumps can still recover it. Never drop the record on a failed
-		// raise.
-		restoreAuthPriority(cfg, auth.ID, auth.Priority)
+		// The raise may have partially applied (e.g. an in-memory change then a
+		// persist failure). Best-effort revert; the bumps record is kept for
+		// reconcileBumps if this also fails. Quiet on failure — the raise error
+		// returned below is what gets surfaced, and a never-applied raise needs
+		// no alarm.
+		_ = tryRestoreAuthPriority(cfg, auth.ID, auth.Priority)
 		return fmt.Errorf("raise priority: %w", err)
 	}
 	defer restoreAuthPriority(cfg, auth.ID, auth.Priority)
 	return sendHi(ctx, cfg, slot, auth)
 }
 
-// restoreAuthPriority returns auth to its original priority. It uses a fresh
-// context so a cancelled run context (slot deadline) cannot skip the restore.
-// On failure the bump record is left in place for reconcileBumps to retry.
-func restoreAuthPriority(cfg pluginConfig, authID string, original int) {
+// tryRestoreAuthPriority returns auth to its original priority and clears the
+// bump record on success. It uses a fresh context so a cancelled run context
+// (slot deadline) cannot skip the restore. On failure the bump record is left
+// for reconcileBumps to retry. It does not log — callers decide.
+func tryRestoreAuthPriority(cfg pluginConfig, authID string, original int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := setAuthPriority(ctx, cfg, authID, original); err != nil {
-		hostLog("error", "codex-window-keeper failed to restore priority after warm; will reconcile later", map[string]any{"auth_id": authID, "priority": original, "error": err.Error()})
-		return
+		return err
 	}
-	_ = clearBump(authID)
+	return clearBump(authID)
+}
+
+// restoreAuthPriority is the post-warm restore. It logs on failure because the
+// auth was actually raised, so a failed restore genuinely owes a reconcile.
+func restoreAuthPriority(cfg pluginConfig, authID string, original int) {
+	if err := tryRestoreAuthPriority(cfg, authID, original); err != nil {
+		hostLog("error", "codex-window-keeper failed to restore raised priority; will reconcile later", map[string]any{"auth_id": authID, "priority": original, "error": err.Error()})
+	}
 }
 
 // reconcileBumps restores any priorities the plugin raised but did not restore
@@ -1172,6 +1169,38 @@ func reconcileBumps(ctx context.Context, cfg pluginConfig) {
 	}
 }
 
+// reconcileLoop restores leftover priority bumps shortly after (re)start — once
+// the host's management listener is up — and periodically thereafter, so a
+// failed restore is not stranded until the next scheduled slot.
+func reconcileLoop(ctx context.Context, cfg pluginConfig) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(20 * time.Second):
+	}
+	reconcileBumpsWithLock(cfg)
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcileBumpsWithLock(cfg)
+		}
+	}
+}
+
+// reconcileBumpsWithLock runs reconcileBumps under runMu (which it requires),
+// with a fresh bounded context. For callers that do not already hold runMu.
+func reconcileBumpsWithLock(cfg pluginConfig) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	runMu.Lock()
+	reconcileBumps(ctx, cfg)
+	runMu.Unlock()
+}
+
 // setAuthPriority patches one auth's priority through the CLIProxyAPI management
 // API. The host applies it immediately and re-persists the auth from its own
 // current in-memory tokens (not a stale plugin snapshot or a disk re-read), so
@@ -1181,10 +1210,11 @@ func setAuthPriority(ctx context.Context, cfg pluginConfig, authID string, prior
 	if cfg.ManagementKey == "" {
 		return fmt.Errorf("management_key is not configured")
 	}
-	client, err := managementHTTPClient(cfg)
+	client, err := newManagementHTTPClient(cfg)
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 	req, err := buildSetPriorityRequest(ctx, cfg, authID, priority)
 	if err != nil {
 		return err
@@ -1219,40 +1249,24 @@ func buildSetPriorityRequest(ctx context.Context, cfg pluginConfig, authID strin
 	return req, nil
 }
 
-var (
-	mgmtClientMu sync.Mutex
-	mgmtClient   *http.Client
-	mgmtClientCA string
-)
-
-// managementHTTPClient returns a client that verifies the management API's TLS
+// newManagementHTTPClient builds a client that verifies the management API's TLS
 // certificate against cfg.ManagementCACert (the host's self-signed cert, whose
-// SAN covers 127.0.0.1). The client is cached and rebuilt when the CA path
-// changes.
-func managementHTTPClient(cfg pluginConfig) (*http.Client, error) {
-	mgmtClientMu.Lock()
-	defer mgmtClientMu.Unlock()
-	if mgmtClient != nil && mgmtClientCA == cfg.ManagementCACert {
-		return mgmtClient, nil
-	}
-	if mgmtClient != nil {
-		mgmtClient.CloseIdleConnections()
-	}
-	pem, err := os.ReadFile(cfg.ManagementCACert)
+// SAN covers 127.0.0.1). A fresh client per call avoids a stale cached root pool
+// if the cert is rotated in place; the keeper makes only a handful of management
+// calls per run, so the cost is negligible.
+func newManagementHTTPClient(cfg pluginConfig) (*http.Client, error) {
+	caPEM, err := os.ReadFile(cfg.ManagementCACert)
 	if err != nil {
 		return nil, fmt.Errorf("read management CA cert %s: %w", cfg.ManagementCACert, err)
 	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
+	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("management CA cert %s contains no certificates", cfg.ManagementCACert)
 	}
-	client := &http.Client{
+	return &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
-	}
-	mgmtClient = client
-	mgmtClientCA = cfg.ManagementCACert
-	return client, nil
+	}, nil
 }
 
 func pickAuth(raw []byte) ([]byte, error) {
