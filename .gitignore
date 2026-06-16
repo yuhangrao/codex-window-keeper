@@ -5,6 +5,8 @@
 # Build artifacts (c-shared output goes to ../plugins/<os>/<arch>/).
 *.so
 *.h
+# Local `go build` binary (named after the package directory).
+/codex-window-keeper
 
 # OS / editor noise.
 .DS_Store
