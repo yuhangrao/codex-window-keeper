@@ -10,3 +10,6 @@
 
 # OS / editor noise.
 .DS_Store
+
+# Local-only files.
+/docs/
