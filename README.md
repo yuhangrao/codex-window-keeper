@@ -59,3 +59,7 @@ plugins:
   ```
 
 > 状态页（及其手动触发）依赖管理端口仅绑定 loopback，请勿将该端口暴露到不可信网络。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 yuhangrao
