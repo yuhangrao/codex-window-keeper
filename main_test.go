@@ -162,6 +162,176 @@ func TestDailyOffsetResetsAtFirstSlotOfNextDay(t *testing.T) {
 	}
 }
 
+func TestNextScheduledRunForAuthAppliesTodayOffset(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.Times = mustParseClockTimes([]string{"22:00", "07:00", "12:00"})
+	loc := mustLocation("Asia/Shanghai")
+	if err := updateAttempt(attemptKey("2026-06-17 07:00", "codex-a.json"), attemptRecord{
+		Slot:   "2026-06-17 07:00",
+		AuthID: "codex-a.json",
+		Status: "sent",
+		SentAt: "2026-06-16T23:00:09Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 6, 17, 9, 44, 30, 0, loc)
+	got, ok := nextScheduledRunForAuth(now, "codex-a.json", cfg, loc)
+	if !ok {
+		t.Fatal("expected a next run")
+	}
+	want := time.Date(2026, 6, 17, 12, 0, 9, 0, loc)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %s, want %s", got, want)
+	}
+}
+
+func TestNextScheduledRunForAuthKeepsCurrentOffsetTarget(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.Times = mustParseClockTimes([]string{"07:00", "12:00", "22:00"})
+	loc := mustLocation("Asia/Shanghai")
+	if err := updateAttempt(attemptKey("2026-06-17 07:00", "codex-a.json"), attemptRecord{
+		Slot:   "2026-06-17 07:00",
+		AuthID: "codex-a.json",
+		Status: "sent",
+		SentAt: "2026-06-16T23:00:09Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 6, 17, 12, 0, 5, 0, loc)
+	got, ok := nextScheduledRunForAuth(now, "codex-a.json", cfg, loc)
+	if !ok {
+		t.Fatal("expected a next run")
+	}
+	want := time.Date(2026, 6, 17, 12, 0, 9, 0, loc)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %s, want %s", got, want)
+	}
+}
+
+func TestNextScheduledRunForAuthWrapsToTomorrow(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.Times = mustParseClockTimes([]string{"07:00", "12:00", "17:00", "22:00"})
+	loc := mustLocation("Asia/Shanghai")
+	now := time.Date(2026, 6, 17, 22, 0, 1, 0, loc)
+	got, ok := nextScheduledRunForAuth(now, "codex-a.json", cfg, loc)
+	if !ok {
+		t.Fatal("expected a next run")
+	}
+	want := time.Date(2026, 6, 18, 7, 0, 0, 0, loc)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %s, want %s", got, want)
+	}
+}
+
+func TestNextScheduledRunForAuthReturnsFalseWithoutTimes(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Times = nil
+	loc := mustLocation("Asia/Shanghai")
+	if got, ok := nextScheduledRunForAuth(time.Date(2026, 6, 17, 9, 44, 30, 0, loc), "codex-a.json", cfg, loc); ok || !got.IsZero() {
+		t.Fatalf("next run with no times = %s, %v; want zero, false", got, ok)
+	}
+}
+
+func TestLastPersistedSummaryRestoresLatestRunAfterRestart(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAttempt(attemptKey("2026-06-17 07:00", "codex-a.json"), attemptRecord{
+		Slot:      "2026-06-17 07:00",
+		AuthID:    "codex-a.json",
+		AuthName:  "codex-a.json",
+		StartedAt: "2026-06-16T23:00:00Z",
+		Status:    "sent",
+		SentAt:    "2026-06-16T23:00:03Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAttempt(attemptKey("manual-2026-06-17 09:44:30", "codex-b.json"), attemptRecord{
+		Slot:      "manual-2026-06-17 09:44:30",
+		AuthID:    "codex-b.json",
+		AuthName:  "codex-b.json",
+		StartedAt: "2026-06-17T01:44:30Z",
+		Status:    "sent",
+		SentAt:    "2026-06-17T01:44:42Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAttempt(attemptKey("manual-2026-06-17 09:44:30", "codex-a.json"), attemptRecord{
+		Slot:      "manual-2026-06-17 09:44:30",
+		AuthID:    "codex-a.json",
+		AuthName:  "codex-a.json",
+		StartedAt: "2026-06-17T01:44:30Z",
+		Status:    "sent",
+		SentAt:    "2026-06-17T01:44:36Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary := lastPersistedSummary()
+	if summary.Slot != "manual-2026-06-17 09:44:30" || summary.StartedAt != "2026-06-17T01:44:30Z" {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if len(summary.Results) != 2 || summary.Results[0].AuthID != "codex-a.json" || summary.Results[1].AuthID != "codex-b.json" {
+		t.Fatalf("summary results not restored and sorted: %#v", summary.Results)
+	}
+	if summary.DryRun {
+		t.Fatalf("real-send run must not be reported as dry run: %#v", summary)
+	}
+}
+
+func TestLastPersistedSummaryInfersDryRun(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAttempt(attemptKey("manual-2026-06-17 09:44:30", "codex-a.json"), attemptRecord{
+		Slot:      "manual-2026-06-17 09:44:30",
+		AuthID:    "codex-a.json",
+		AuthName:  "codex-a.json",
+		StartedAt: "2026-06-17T01:44:30Z",
+		Status:    "dry_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary := lastPersistedSummary()
+	if !summary.DryRun {
+		t.Fatalf("all-dry_run run must be reported as dry run: %#v", summary)
+	}
+}
+
+func TestRenderStatusPageRestoresLastRunAfterRestart(t *testing.T) {
+	if err := loadState(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { setRunning("") })
+	setRunning("")
+	setLastSummary(runSummary{}) // simulate a fresh process with empty in-memory summary
+	if err := updateAttempt(attemptKey("2026-06-17 07:00", "codex-a.json"), attemptRecord{
+		Slot:      "2026-06-17 07:00",
+		AuthID:    "codex-a.json",
+		AuthName:  "codex-a.json",
+		StartedAt: "2026-06-16T23:00:00Z",
+		Status:    "sent",
+		SentAt:    "2026-06-16T23:00:03Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	page := string(renderStatusPage())
+	if !strings.Contains(page, "2026-06-17 07:00") {
+		t.Fatalf("status page must restore the persisted last-run slot after restart; page:\n%s", page)
+	}
+	if strings.Contains(page, "No run recorded yet.") {
+		t.Fatal("status page must not show 'No run recorded yet.' when a persisted run exists")
+	}
+}
+
 func TestIsCodexFileAuth(t *testing.T) {
 	if !isCodexFileAuth(authEntry{ID: "1", Name: "codex-user@example.com-team.json", Provider: "codex", Source: "file"}) {
 		t.Fatal("expected codex file auth")

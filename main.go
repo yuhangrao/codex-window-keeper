@@ -1389,6 +1389,12 @@ func renderStatusPage() []byte {
 	cfg := currentConfig()
 	summary := getLastSummary()
 	running := getRunning()
+	// After a restart the in-memory summary is empty; reconstruct the last run
+	// from persisted attempts. Only the idle "Last run" view needs it — the
+	// live-run branch reads attemptsForSlot, so skip the scan while running.
+	if running == "" && summary.Slot == "" {
+		summary = lastPersistedSummary()
+	}
 	loc := mustLocation(cfg.Timezone)
 	stateMu.Lock()
 	attemptCount := len(keeperState.Attempts)
@@ -1495,7 +1501,8 @@ func renderStatusPage() []byte {
 		if len(results) == 0 {
 			out.WriteString(`<p class="muted">Starting&hellip;</p>`)
 		} else {
-			out.WriteString(`<table><thead><tr><th>Credential</th><th>Status</th><th>Target</th><th>Sent / last try</th><th>Tries</th><th>Detail</th></tr></thead><tbody>`)
+			now := time.Now()
+			out.WriteString(`<table><thead><tr><th>Credential</th><th>Status</th><th>Target</th><th>Sent / last try</th><th>Tries</th><th>Next run</th><th>Detail</th></tr></thead><tbody>`)
 			for _, r := range results {
 				sentOrLast := r.SentAt
 				if sentOrLast == "" {
@@ -1519,6 +1526,14 @@ func renderStatusPage() []byte {
 				out.WriteString(html.EscapeString(fmtClockOrRaw(sentOrLast, loc)))
 				out.WriteString(`</td><td>`)
 				out.WriteString(strconv.Itoa(r.AttemptCount))
+				out.WriteString(`</td><td class="mono">`)
+				nextRun := "—"
+				if cfg.Enabled {
+					if nextAt, ok := nextScheduledRunForAuth(now, r.AuthID, cfg, loc); ok {
+						nextRun = nextAt.Format("01-02 15:04:05")
+					}
+				}
+				out.WriteString(html.EscapeString(nextRun))
 				out.WriteString(`</td><td class="err">`)
 				out.WriteString(html.EscapeString(r.Error))
 				out.WriteString(`</td></tr>`)
@@ -1614,6 +1629,31 @@ func fmtClockOrRaw(rfc3339 string, loc *time.Location) string {
 		return t.In(loc).Format("01-02 15:04:05")
 	}
 	return rfc3339
+}
+
+func nextScheduledRunForAuth(now time.Time, authID string, cfg pluginConfig, loc *time.Location) (time.Time, bool) {
+	if strings.TrimSpace(authID) == "" || len(cfg.Times) == 0 {
+		return time.Time{}, false
+	}
+	localNow := now.In(loc)
+	var next time.Time
+	for dayOffset := 0; dayOffset <= 1; dayOffset++ {
+		year, month, day := localNow.AddDate(0, 0, dayOffset).Date()
+		for _, scheduled := range cfg.Times {
+			nominalAt := time.Date(year, month, day, scheduled.Hour, scheduled.Minute, 0, 0, loc)
+			targetAt := nominalAt.Add(dailyOffsetBeforeSlot(authID, nominalAt, cfg, loc))
+			if !targetAt.After(localNow) {
+				continue
+			}
+			if next.IsZero() || targetAt.Before(next) {
+				next = targetAt
+			}
+		}
+		if !next.IsZero() {
+			return next, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func currentConfig() pluginConfig {
@@ -1809,6 +1849,58 @@ func recordsFromMap(records map[string]attemptRecord) []attemptRecord {
 		return strings.ToLower(out[i].AuthName) < strings.ToLower(out[j].AuthName)
 	})
 	return out
+}
+
+func lastPersistedSummary() runSummary {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	latestSlot := ""
+	latestStarted := ""
+	latestKey := ""
+	for _, record := range keeperState.Attempts {
+		if strings.TrimSpace(record.Slot) == "" {
+			continue
+		}
+		key := recordRunSortKey(record)
+		if latestSlot == "" || key > latestKey {
+			latestSlot = record.Slot
+			latestStarted = record.StartedAt
+			latestKey = key
+		}
+	}
+	if latestSlot == "" {
+		return runSummary{}
+	}
+	out := make([]attemptRecord, 0)
+	// A whole run shares one cfg.DryRun, so every record in the slot has the same
+	// dry-run status; start true and clear on the first non-dry record. (latestSlot
+	// is non-empty here, so the slot always has at least one record.)
+	dryRun := true
+	for _, record := range keeperState.Attempts {
+		if record.Slot != latestSlot {
+			continue
+		}
+		out = append(out, record)
+		if record.Status != "dry_run" {
+			dryRun = false
+		}
+		if latestStarted == "" {
+			latestStarted = record.StartedAt
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].AuthName) < strings.ToLower(out[j].AuthName)
+	})
+	return runSummary{Slot: latestSlot, StartedAt: latestStarted, DryRun: dryRun, Results: out}
+}
+
+func recordRunSortKey(record attemptRecord) string {
+	for _, value := range []string{record.StartedAt, record.SentAt, record.LastAttemptAt, record.TargetAt, record.Slot} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func setLastSummary(summary runSummary) {

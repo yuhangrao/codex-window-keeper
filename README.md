@@ -52,7 +52,7 @@ Every field except `enabled` has a default and may be omitted.
 
 - Once CLIProxyAPI starts, the plugin runs automatically at each time in `times` — no intervention needed.
 - To change the keepalive model, edit `model` in `config.yaml`; rebuilding the `.so` is not required.
-- To view status / the last run result, or trigger a run manually:
+- To view status — each credential's last result and its next scheduled run — or trigger a run manually:
 
   ```text
   https://127.0.0.1:8317/v0/resource/plugins/codex-window-keeper/status
