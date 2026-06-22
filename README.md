@@ -1,5 +1,7 @@
 # Codex Window Keeper
 
+**Positioning:** a CLIProxyAPI plugin that pins file-based Codex OAuth 5-hour usage windows by warming each credential at fixed daily slots.
+
 A CLIProxyAPI plugin that sends a lightweight request (`hi`) to each file-based Codex OAuth credential at fixed times every day, pinning each account's 5-hour rate-limit window to those slots so it doesn't drift. Default times are `07:00`, `12:00`, `17:00`, `22:00` (configurable).
 
 ## Build

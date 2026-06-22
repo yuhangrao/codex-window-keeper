@@ -97,6 +97,14 @@ const (
 	defaultTargetHeader = "X-Codex-Window-Keeper-Target-Auth"
 	defaultMarkerHeader = "X-Codex-Window-Keeper"
 
+	// runDiagnosticAuthID is a reserved sentinel auth ID for whole-run diagnostics
+	// (for example, no enabled file-based Codex OAuth credentials). Real auth
+	// attempt logic must go through isRunDiagnosticRecord/runDiagnosticAttemptKey
+	// instead of open-coding this value, so a normal auth cannot accidentally be
+	// counted or scheduled as a warm attempt if a collision ever appears.
+	runDiagnosticAuthID   = "__codex_window_keeper_run_diagnostic__"
+	runDiagnosticAuthName = "Run diagnostic"
+
 	// managementAuthFieldsPath is the CLIProxyAPI management endpoint that patches
 	// individual auth-file fields (used here to temporarily raise an auth's
 	// priority so the host's selection will route a keepalive to it).
@@ -214,21 +222,22 @@ type authListResponse struct {
 }
 
 type authEntry struct {
-	ID          string `json:"id"`
-	AuthIndex   string `json:"auth_index"`
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Provider    string `json:"provider"`
-	Label       string `json:"label"`
-	Status      string `json:"status"`
-	Disabled    bool   `json:"disabled"`
-	Unavailable bool   `json:"unavailable"`
-	RuntimeOnly bool   `json:"runtime_only"`
-	Source      string `json:"source"`
-	Path        string `json:"path"`
-	Email       string `json:"email"`
-	Note        string `json:"note"`
-	Priority    int    `json:"priority"`
+	ID            string `json:"id"`
+	AuthIndex     string `json:"auth_index"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Provider      string `json:"provider"`
+	Label         string `json:"label"`
+	Status        string `json:"status"`
+	StatusMessage string `json:"status_message"`
+	Disabled      bool   `json:"disabled"`
+	Unavailable   bool   `json:"unavailable"`
+	RuntimeOnly   bool   `json:"runtime_only"`
+	Source        string `json:"source"`
+	Path          string `json:"path"`
+	Email         string `json:"email"`
+	Note          string `json:"note"`
+	Priority      int    `json:"priority"`
 }
 
 type hostModelExecutionRequest struct {
@@ -534,7 +543,7 @@ func defaultConfig() pluginConfig {
 		ExitProtocol:     "codex",
 		AuthDir:          "/root/.cli-proxy-api",
 		StateDir:         "/CLIProxyAPI/codex-window-keeper-state",
-		RunTimeout:       10 * time.Minute,
+		RunTimeout:       1 * time.Minute,
 		BetweenAuthDelay: 2 * time.Second,
 		RetryDelay:       15 * time.Second,
 		TargetHeader:     defaultTargetHeader,
@@ -591,7 +600,7 @@ func (cfg *pluginConfig) normalize() {
 		cfg.StateDir = "/CLIProxyAPI/codex-window-keeper-state"
 	}
 	if cfg.RunTimeout <= 0 {
-		cfg.RunTimeout = 10 * time.Minute
+		cfg.RunTimeout = 1 * time.Minute
 	}
 	if cfg.BetweenAuthDelay < 0 {
 		cfg.BetweenAuthDelay = 0
@@ -795,7 +804,7 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 	reconcileBumps(reconcileCtx, cfg)
 	reconcileCancel()
 	listCtx, listCancel := context.WithTimeout(parent, 30*time.Second)
-	auths, err := listCodexAuths(listCtx, cfg)
+	rawAuths, err := listCodexAuthEntries(listCtx, cfg)
 	listCancel()
 	if err != nil {
 		record := attemptRecord{Slot: slot, StartedAt: startedAt, Status: "list_failed", Error: err.Error()}
@@ -803,6 +812,32 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 		setLastSummary(summary)
 		hostLog("error", "codex-window-keeper failed to list auths", map[string]any{"slot": slot, "error": err.Error()})
 		return
+	}
+	managedAuths := managedCodexAuths(rawAuths)
+	invalidAuths := invalidCodexAuths(managedAuths)
+	auths := warmableCodexAuths(managedAuths)
+	invalidDiagnostics := persistAuthInvalidDiagnostics(slot, startedAt, invalidAuths)
+	if len(managedAuths) == 0 {
+		record := persistRunDiagnostic(slot, startedAt, "no_auths", "no enabled file-based Codex OAuth credentials found")
+		summary.Results = append(summary.Results, record)
+		setLastSummary(summary)
+		if manual {
+			hostLog("info", "codex-window-keeper manual run completed", map[string]any{"slot": slot, "count": 0, "diagnostic": "no_auths"})
+		}
+		return
+	}
+	if len(auths) == 0 {
+		record := persistRunDiagnostic(slot, startedAt, "no_warmable_auths", "enabled file-based Codex OAuth credentials exist, but none are currently warmable")
+		summary.Results = append(summary.Results, invalidDiagnostics...)
+		summary.Results = append(summary.Results, record)
+		setLastSummary(summary)
+		if manual {
+			hostLog("info", "codex-window-keeper manual run completed", map[string]any{"slot": slot, "count": 0, "diagnostic": "no_warmable_auths"})
+		}
+		return
+	}
+	if errState := clearRunDiagnostic(slot); errState != nil {
+		hostLog("warn", "codex-window-keeper failed to clear stale run diagnostic", map[string]any{"slot": slot, "error": errState.Error()})
 	}
 
 	// The host offers only the highest-priority tier as scheduler candidates;
@@ -837,7 +872,10 @@ func runSlot(parent context.Context, cfg pluginConfig, slot string, manual bool)
 	defer cancel()
 
 	pending := make(map[string]authEntry, len(auths))
-	latest := make(map[string]attemptRecord, len(auths))
+	latest := make(map[string]attemptRecord, len(auths)+len(invalidDiagnostics))
+	for _, record := range invalidDiagnostics {
+		latest[record.AuthID] = record
+	}
 	for _, auth := range auths {
 		key := attemptKey(slot, auth.ID)
 		if record, ok := getAttempt(key); ok && isTerminalSuccess(record) {
@@ -985,9 +1023,17 @@ func hasLaterPending(auths []authEntry, index int, pending map[string]authEntry)
 }
 
 func listCodexAuths(ctx context.Context, cfg pluginConfig) ([]authEntry, error) {
+	entries, err := listCodexAuthEntries(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeAuthEntries(entries, cfg), nil
+}
+
+func listCodexAuthEntries(ctx context.Context, cfg pluginConfig) ([]authEntry, error) {
 	result, err := callHost(ctx, methodHostAuthList, map[string]any{})
 	if err != nil {
-		auths, fallbackErr := listCodexAuthsFromDir(cfg)
+		auths, fallbackErr := listCodexAuthEntriesFromDir(cfg)
 		if fallbackErr != nil {
 			return nil, fmt.Errorf("%w; fallback auth dir failed: %v", err, fallbackErr)
 		}
@@ -998,10 +1044,44 @@ func listCodexAuths(ctx context.Context, cfg pluginConfig) ([]authEntry, error) 
 	if err := json.Unmarshal(result, &resp); err != nil {
 		return nil, fmt.Errorf("decode host auth list: %w", err)
 	}
-	return normalizeAuthEntries(resp.Files, cfg), nil
+	return resp.Files, nil
 }
 
 func normalizeAuthEntries(entries []authEntry, cfg pluginConfig) []authEntry {
+	_ = cfg
+	return warmableCodexAuths(entries)
+}
+
+func isLoginInvalidAuth(entry authEntry) bool {
+	statusMessage := strings.TrimSpace(entry.StatusMessage)
+	if statusMessage == "" {
+		return false
+	}
+	if statusMessage == "unauthorized" {
+		return true
+	}
+
+	var payload struct {
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(statusMessage), &payload); err != nil {
+		return false
+	}
+	if payload.Error.Type == "authentication_error" {
+		return true
+	}
+	switch payload.Error.Code {
+	case "unauthorized", "no_credentials", "invalid_credential":
+		return true
+	default:
+		return false
+	}
+}
+
+func managedCodexAuths(entries []authEntry) []authEntry {
 	out := make([]authEntry, 0, len(entries))
 	seen := map[string]struct{}{}
 	for _, entry := range entries {
@@ -1009,9 +1089,6 @@ func normalizeAuthEntries(entries []authEntry, cfg pluginConfig) []authEntry {
 			continue
 		}
 		if entry.Disabled {
-			continue
-		}
-		if entry.Unavailable && !cfg.IncludeUnavailableAuths {
 			continue
 		}
 		if entry.ID == "" {
@@ -1032,7 +1109,42 @@ func normalizeAuthEntries(entries []authEntry, cfg pluginConfig) []authEntry {
 	return out
 }
 
+func warmableCodexAuths(entries []authEntry) []authEntry {
+	managed := managedCodexAuths(entries)
+	out := make([]authEntry, 0, len(managed))
+	for _, entry := range managed {
+		if isLoginInvalidAuth(entry) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func invalidCodexAuths(entries []authEntry) []authEntry {
+	managed := managedCodexAuths(entries)
+	out := make([]authEntry, 0, len(managed))
+	for _, entry := range managed {
+		if isLoginInvalidAuth(entry) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func countDisplayCodexCredentials(entries []authEntry) int {
+	return len(warmableCodexAuths(entries))
+}
+
 func listCodexAuthsFromDir(cfg pluginConfig) ([]authEntry, error) {
+	entries, err := listCodexAuthEntriesFromDir(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeAuthEntries(entries, cfg), nil
+}
+
+func listCodexAuthEntriesFromDir(cfg pluginConfig) ([]authEntry, error) {
 	entries, err := os.ReadDir(cfg.AuthDir)
 	if err != nil {
 		return nil, err
@@ -1060,17 +1172,39 @@ func listCodexAuthsFromDir(cfg pluginConfig) ([]authEntry, error) {
 		// the same fields the host auth-list callback would provide.
 		if raw, errRead := os.ReadFile(path); errRead == nil {
 			var meta struct {
-				Priority int  `json:"priority"`
-				Disabled bool `json:"disabled"`
+				Priority      int    `json:"priority"`
+				Disabled      bool   `json:"disabled"`
+				Unavailable   bool   `json:"unavailable"`
+				StatusMessage string `json:"status_message"`
+				RuntimeOnly   bool   `json:"runtime_only"`
+				Source        string `json:"source"`
+				Path          string `json:"path"`
+				Provider      string `json:"provider"`
+				Type          string `json:"type"`
 			}
 			if json.Unmarshal(raw, &meta) == nil {
 				ae.Priority = meta.Priority
 				ae.Disabled = meta.Disabled
+				ae.Unavailable = meta.Unavailable
+				ae.StatusMessage = meta.StatusMessage
+				ae.RuntimeOnly = meta.RuntimeOnly
+				if strings.TrimSpace(meta.Source) != "" {
+					ae.Source = meta.Source
+				}
+				if strings.TrimSpace(meta.Path) != "" {
+					ae.Path = meta.Path
+				}
+				if strings.TrimSpace(meta.Provider) != "" {
+					ae.Provider = meta.Provider
+				}
+				if strings.TrimSpace(meta.Type) != "" {
+					ae.Type = meta.Type
+				}
 			}
 		}
 		auths = append(auths, ae)
 	}
-	return normalizeAuthEntries(auths, cfg), nil
+	return auths, nil
 }
 
 func isCodexFileAuth(entry authEntry) bool {
@@ -1386,6 +1520,10 @@ func handleManagement(raw []byte) ([]byte, error) {
 }
 
 func renderStatusPage() []byte {
+	return renderStatusPageWithAuthLister(listCodexAuthEntries)
+}
+
+func renderStatusPageWithAuthLister(authLister func(context.Context, pluginConfig) ([]authEntry, error)) []byte {
 	cfg := currentConfig()
 	summary := getLastSummary()
 	running := getRunning()
@@ -1396,15 +1534,13 @@ func renderStatusPage() []byte {
 		summary = lastPersistedSummary()
 	}
 	loc := mustLocation(cfg.Timezone)
-	stateMu.Lock()
-	attemptCount := len(keeperState.Attempts)
-	stateMu.Unlock()
+	attemptCount := recordedWarmAttemptCount()
 
 	authCount := ""
 	authErr := ""
 	authCheckCtx, authCheckCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if auths, err := listCodexAuths(authCheckCtx, cfg); err == nil {
-		authCount = strconv.Itoa(len(auths))
+	if auths, err := authLister(authCheckCtx, cfg); err == nil {
+		authCount = strconv.Itoa(countDisplayCodexCredentials(auths))
 	} else {
 		authErr = err.Error()
 	}
@@ -1499,7 +1635,11 @@ func renderStatusPage() []byte {
 		}
 		out.WriteString(`</p>`)
 		if len(results) == 0 {
-			out.WriteString(`<p class="muted">Starting&hellip;</p>`)
+			if running != "" {
+				out.WriteString(`<p class="muted">Preparing&hellip;</p>`)
+			} else {
+				out.WriteString(`<p class="muted">No attempts were recorded for this run.</p>`)
+			}
 		} else {
 			now := time.Now()
 			out.WriteString(`<table><thead><tr><th>Credential</th><th>Status</th><th>Target</th><th>Sent / last try</th><th>Tries</th><th>Next run</th><th>Detail</th></tr></thead><tbody>`)
@@ -1527,12 +1667,7 @@ func renderStatusPage() []byte {
 				out.WriteString(`</td><td>`)
 				out.WriteString(strconv.Itoa(r.AttemptCount))
 				out.WriteString(`</td><td class="mono">`)
-				nextRun := "—"
-				if cfg.Enabled {
-					if nextAt, ok := nextScheduledRunForAuth(now, r.AuthID, cfg, loc); ok {
-						nextRun = nextAt.Format("01-02 15:04:05")
-					}
-				}
+				nextRun := nextRunDisplayForRecord(now, r, cfg, loc)
 				out.WriteString(html.EscapeString(nextRun))
 				out.WriteString(`</td><td class="err">`)
 				out.WriteString(html.EscapeString(r.Error))
@@ -1629,6 +1764,16 @@ func fmtClockOrRaw(rfc3339 string, loc *time.Location) string {
 		return t.In(loc).Format("01-02 15:04:05")
 	}
 	return rfc3339
+}
+
+func nextRunDisplayForRecord(now time.Time, record attemptRecord, cfg pluginConfig, loc *time.Location) string {
+	if !cfg.Enabled || isRunDiagnosticRecord(record) {
+		return "—"
+	}
+	if nextAt, ok := nextScheduledRunForAuth(now, record.AuthID, cfg, loc); ok {
+		return nextAt.Format("01-02 15:04:05")
+	}
+	return "—"
 }
 
 func nextScheduledRunForAuth(now time.Time, authID string, cfg pluginConfig, loc *time.Location) (time.Time, bool) {
@@ -1836,6 +1981,89 @@ func attemptKey(slot, authID string) string {
 	return slot + "|" + authID
 }
 
+func runDiagnosticAttemptKey(slot string) string {
+	return attemptKey(slot, runDiagnosticAuthID)
+}
+
+func runDiagnosticRecord(slot, startedAt, status, detail string) attemptRecord {
+	return attemptRecord{
+		Slot:      slot,
+		AuthID:    runDiagnosticAuthID,
+		AuthName:  runDiagnosticAuthName,
+		StartedAt: startedAt,
+		Status:    status,
+		Error:     detail,
+	}
+}
+
+func persistRunDiagnostic(slot, startedAt, status, detail string) attemptRecord {
+	record := runDiagnosticRecord(slot, startedAt, status, detail)
+	if errState := updateAttempt(runDiagnosticAttemptKey(slot), record); errState != nil {
+		record.Status = "state_failed"
+		record.Error = errState.Error()
+		hostLog("warn", "codex-window-keeper failed to persist run diagnostic", map[string]any{"slot": slot, "diagnostic": status, "error": errState.Error()})
+	}
+	return record
+}
+
+func clearRunDiagnostic(slot string) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	key := runDiagnosticAttemptKey(slot)
+	record, ok := keeperState.Attempts[key]
+	if !ok || !isRunDiagnosticRecord(record) {
+		return nil
+	}
+	delete(keeperState.Attempts, key)
+	return saveStateLocked()
+}
+
+func authInvalidRecord(slot, startedAt string, auth authEntry) attemptRecord {
+	return attemptRecord{
+		Slot:      slot,
+		AuthID:    auth.ID,
+		AuthName:  auth.Name,
+		StartedAt: startedAt,
+		Status:    "auth_invalid",
+		Error:     "credential has an invalid Codex login state: " + strings.TrimSpace(auth.StatusMessage),
+	}
+}
+
+func persistAuthInvalidDiagnostics(slot, startedAt string, auths []authEntry) []attemptRecord {
+	records := make([]attemptRecord, 0, len(auths))
+	for _, auth := range auths {
+		record := authInvalidRecord(slot, startedAt, auth)
+		if errState := updateAttempt(attemptKey(slot, auth.ID), record); errState != nil {
+			record.Status = "state_failed"
+			record.Error = errState.Error()
+			hostLog("warn", "codex-window-keeper failed to persist auth-invalid diagnostic", map[string]any{"slot": slot, "auth_id": auth.ID, "error": errState.Error()})
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func isRunDiagnosticRecord(record attemptRecord) bool {
+	return record.AuthID == runDiagnosticAuthID && record.AuthName == runDiagnosticAuthName
+}
+
+func isDiagnosticRecord(record attemptRecord) bool {
+	return isRunDiagnosticRecord(record) || record.Status == "auth_invalid"
+}
+
+func recordedWarmAttemptCount() int {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	count := 0
+	for _, record := range keeperState.Attempts {
+		if isDiagnosticRecord(record) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 func isTerminalSuccess(record attemptRecord) bool {
 	return record.Status == "sent"
 }
@@ -1872,20 +2100,23 @@ func lastPersistedSummary() runSummary {
 		return runSummary{}
 	}
 	out := make([]attemptRecord, 0)
-	// A whole run shares one cfg.DryRun, so every record in the slot has the same
-	// dry-run status; start true and clear on the first non-dry record. (latestSlot
-	// is non-empty here, so the slot always has at least one record.)
-	dryRun := true
 	for _, record := range keeperState.Attempts {
 		if record.Slot != latestSlot {
 			continue
 		}
 		out = append(out, record)
-		if record.Status != "dry_run" {
-			dryRun = false
-		}
 		if latestStarted == "" {
 			latestStarted = record.StartedAt
+		}
+	}
+	out = suppressStaleRunDiagnostics(out)
+	// A whole run shares one cfg.DryRun, so every record in the slot has the same
+	// dry-run status; start true and clear on the first non-dry record. (latestSlot
+	// is non-empty here, so the slot always has at least one record.)
+	dryRun := true
+	for _, record := range out {
+		if record.Status != "dry_run" {
+			dryRun = false
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1901,6 +2132,27 @@ func recordRunSortKey(record attemptRecord) string {
 		}
 	}
 	return ""
+}
+
+func suppressStaleRunDiagnostics(records []attemptRecord) []attemptRecord {
+	hasWarmAttempt := false
+	for _, record := range records {
+		if !isDiagnosticRecord(record) {
+			hasWarmAttempt = true
+			break
+		}
+	}
+	if !hasWarmAttempt {
+		return records
+	}
+	out := records[:0]
+	for _, record := range records {
+		if isRunDiagnosticRecord(record) {
+			continue
+		}
+		out = append(out, record)
+	}
+	return out
 }
 
 func setLastSummary(summary runSummary) {
@@ -1946,6 +2198,7 @@ func attemptsForSlot(slot string) []attemptRecord {
 			out = append(out, record)
 		}
 	}
+	out = suppressStaleRunDiagnostics(out)
 	sort.Slice(out, func(i, j int) bool {
 		return strings.ToLower(out[i].AuthName) < strings.ToLower(out[j].AuthName)
 	})
