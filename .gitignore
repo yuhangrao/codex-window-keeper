@@ -2,14 +2,32 @@
 /state/*
 !/state/.gitkeep
 
+# Local files that must never be published.
+/config.yaml
+/auths/
+/certs/
+/*management-key*
+/plugins/
+
+# Local notes and tool configuration.
+/CLAUDE.md
+/Claude.md
+/AGENTS.md
+/Agents.md
+/.claude/
+/.codex/
+
+# Local project notes.
+/docs/
+
 # Build artifacts (c-shared output goes to ../plugins/<os>/<arch>/).
 *.so
 *.h
 # Local `go build` binary (named after the package directory).
 /codex-window-keeper
 
-# OS / editor noise.
+# Logs, backups, OS/editor noise.
+*.log
+*.bak
+*.bak-*
 .DS_Store
-
-# Local-only files.
-/docs/
